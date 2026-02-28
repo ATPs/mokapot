@@ -15,7 +15,11 @@ from . import __version__
 from .brew import brew
 from .confidence import assign_confidence
 from .config import Config
-from .model import PercolatorModel, load_model
+from .model import (
+    PercolatorModel,
+    load_models as load_models_file,
+    save_percolator_models,
+)
 from .parsers.fasta import read_fasta
 from .parsers.pin import read_pin
 
@@ -98,7 +102,12 @@ def main(main_args=None):
     # Define a model:
     model = None
     if config.load_models:
-        model = [load_model(model_file) for model_file in config.load_models]
+        model = []
+        for model_file in config.load_models:
+            model.extend(load_models_file(model_file))
+        for i, loaded_model in enumerate(model):
+            if loaded_model.fold is None:
+                loaded_model.fold = i
 
     if model is None:
         logging.debug("Loading Percolator model.")
@@ -162,6 +171,18 @@ def main(main_args=None):
                 out_file = config.dest_dir / out_file
 
             trained_model.save(out_file)
+
+    if config.save_percolator_models:
+        logging.info("Saving Percolator-style models...")
+        out_file = Path("mokapot.model.weights.txt")
+
+        if config.file_root is not None:
+            out_file = Path(config.file_root + "." + out_file.name)
+
+        if config.dest_dir is not None:
+            out_file = config.dest_dir / out_file
+
+        save_percolator_models(models, out_file)
 
     total_time = round(time.time() - start)
     total_time = str(datetime.timedelta(seconds=total_time))

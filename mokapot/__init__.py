@@ -20,7 +20,14 @@ except ImportError:
 from .dataset import LinearPsmDataset, OnDiskPsmDataset  # noqa: I001
 from .brew import brew
 from .confidence import Confidence, assign_confidence
-from .model import Model, PercolatorModel, load_model, save_model
+from .model import (
+    Model,
+    PercolatorModel,
+    load_model,
+    load_models,
+    save_model,
+    save_percolator_models,
+)
 from .parsers.fasta import digest, make_decoys, read_fasta
 from .parsers.pepxml import read_pepxml
 from .parsers.pin import read_percolator, read_pin
@@ -35,7 +42,9 @@ __all__ = [
     "Model",
     "PercolatorModel",
     "load_model",
+    "load_models",
     "save_model",
+    "save_percolator_models",
     "read_fasta",
     "read_pepxml",
     "read_percolator",

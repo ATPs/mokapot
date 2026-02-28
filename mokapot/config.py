@@ -269,7 +269,22 @@ def _parser():
         "--save_models",
         default=False,
         action="store_true",
-        help="Save the models learned by mokapot as pickled Python objects.",
+        help=(
+            "Save the models learned by mokapot as pickled Python "
+            "objects (.pkl)."
+        ),
+    )
+
+    parser.add_argument(
+        "--save-percolator-models",
+        "--save_percolator_models",
+        default=False,
+        action="store_true",
+        help=(
+            "Save the trained models as a single Percolator-style "
+            "weights file ('mokapot.model.weights.txt'). This file can "
+            "be reused with --load_models."
+        ),
     )
 
     parser.add_argument(
@@ -277,8 +292,10 @@ def _parser():
         type=Path,
         nargs="+",
         help=(
-            "Load previously saved models and skip model training."
-            "Note that the number of models must match the value of --folds."
+            "Load previously saved models and skip model training. "
+            "Supports mokapot pickled models (.pkl) and Percolator "
+            "--weights files (which may contain multiple fold models). "
+            "After expansion, the number of models must match --folds."
         ),
     )
 

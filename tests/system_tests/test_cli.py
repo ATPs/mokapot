@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from mokapot.column_defs import STANDARD_COLUMN_NAME_MAP
+from mokapot.config import Config
 
 from ..helpers.cli import run_mokapot_cli
 from ..helpers.utils import (
@@ -99,6 +100,15 @@ def test_basic_cli(tmp_path, scope_files):
 
     assert targets_psms_df.iloc[0, 0] == "target_0_11040_3_-1"
     assert targets_psms_df["Proteins"].iloc[0] == "sp|P10809|CH60_HUMAN"
+
+
+def test_cli_help_mentions_model_formats():
+    """Test --help messages for model save/load options."""
+    help_text = Config().parser.format_help()
+    assert "--save-percolator-models" in help_text
+    assert "Percolator" in help_text
+    assert "--weights files" in help_text
+    assert "pickled models (.pkl)" in help_text
 
 
 @pytest.mark.slow
@@ -386,6 +396,52 @@ def test_cli_saved_models(tmp_path, phospho_files):
     run_mokapot_cli(params)
     assert file_approx_len(tmp_path, "targets.psms.tsv", 42331)
     assert file_approx_len(tmp_path, "targets.peptides.tsv", 33538)
+
+
+def test_cli_saved_percolator_models(tmp_path, phospho_files):
+    """Test that Percolator-style model save/load works."""
+    params = [
+        phospho_files[0],
+        ("--dest_dir", tmp_path),
+        ("--test_fdr", "0.01"),
+    ]
+
+    run_mokapot_cli(params + ["--save_percolator_models"])
+
+    weights_file = tmp_path / "mokapot.model.weights.txt"
+    assert weights_file.exists()
+
+    params += ["--load_models", weights_file]
+    run_mokapot_cli(params)
+    assert file_approx_len(tmp_path, "targets.psms.tsv", 42331)
+    assert file_approx_len(tmp_path, "targets.peptides.tsv", 33538)
+
+
+def test_cli_mixed_model_inputs(tmp_path, scope_files):
+    """Test loading mixed pickle and Percolator-style model inputs."""
+    train_params = [
+        scope_files[0],
+        ("--dest_dir", tmp_path),
+        ("--folds", "2"),
+        ("--max_iter", "1"),
+    ]
+    run_mokapot_cli(
+        train_params + ["--save_models", "--save_percolator_models"]
+    )
+
+    pickle_model = sorted(Path(tmp_path).glob("*.pkl"))[0]
+    weights_file = tmp_path / "mokapot.model.weights.txt"
+
+    load_params = [
+        scope_files[0],
+        ("--dest_dir", tmp_path),
+        ("--folds", "3"),
+        ("--max_iter", "1"),
+        ("--load_models", pickle_model, weights_file),
+    ]
+    run_mokapot_cli(load_params)
+    assert file_exist(tmp_path, "targets.psms.tsv")
+    assert file_exist(tmp_path, "targets.peptides.tsv")
 
 
 def test_cli_skip_rollup(tmp_path, phospho_files):

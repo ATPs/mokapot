@@ -19,7 +19,6 @@ import pickle
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import GridSearchCV, KFold
@@ -51,6 +50,12 @@ class BestFeatureIsBetterError(RuntimeError):
 
 class ModelIterationError(RuntimeError):
     """Raised when the model does not improve after training."""
+
+    pass
+
+
+class PercolatorWeightsParseError(ValueError):
+    """Raised when a file cannot be parsed as Percolator weights."""
 
     pass
 
@@ -516,6 +521,86 @@ def save_model(model, out_file: Path):
 
 
 @typechecked
+def save_percolator_models(models: list[Model], out_file: Path):
+    """
+    Save trained models as a single Percolator-style weights file.
+
+    Parameters
+    ----------
+    models : list[mokapot.model.Model]
+        Trained models, one for each cross-validation fold.
+    out_file : str
+        Output path for the Percolator-style weights file.
+
+    Returns
+    -------
+    str
+        The output file name.
+    """
+    if not models:
+        raise ValueError("At least one model is required to save weights.")
+
+    feature_names = None
+    with open(out_file, "w", encoding="utf-8") as stream:
+        stream.write(
+            "# This file contains the weights from each cross validation "
+            "bin from percolator training\n"
+        )
+        stream.write(
+            "# First line is the feature names, followed by normalized "
+            "weights, and the raw weights of bin 1\n"
+        )
+        stream.write("# This is repeated for the other bins\n")
+
+        for model in models:
+            features, norm_row, raw_row = _extract_weight_rows(model)
+            if feature_names is None:
+                feature_names = features
+            elif features != feature_names:
+                raise ValueError(
+                    "All models must use the same features to be saved as "
+                    "a single Percolator weights file."
+                )
+
+            stream.write("\t".join([*features, "m0"]) + "\n")
+            stream.write(_format_weight_row(norm_row) + "\n")
+            stream.write(_format_weight_row(raw_row) + "\n")
+
+    return out_file
+
+
+@typechecked
+def load_models(model_file: Path):
+    """
+    Load one or more models for mokapot.
+
+    Parameters
+    ----------
+    model_file : str
+        File containing either pickled mokapot models or Percolator weights.
+
+    Returns
+    -------
+    list[mokapot.model.Model]
+        One or more loaded :py:class:`mokapot.model.Model` objects.
+
+    Warnings
+    --------
+    Unpickling data in Python is unsafe. Make sure that the model is from
+    a source that you trust.
+    """
+    try:
+        models = _load_percolator_models(model_file)
+        LOGGER.info("Loading %i Percolator model(s).", len(models))
+        return models
+    except (PercolatorWeightsParseError, UnicodeDecodeError):
+        LOGGER.info("Loading mokapot model.")
+        with open(model_file, "rb") as mod_in:
+            model = pickle.load(mod_in)
+        return [model]
+
+
+@typechecked
 def load_model(model_file: Path):
     """
     Load a saved model for mokapot.
@@ -539,30 +624,203 @@ def load_model(model_file: Path):
     Unpickling data in Python is unsafe. Make sure that the model is from
     a source that you trust.
     """
-    # Try a percolator model first:
-    try:
-        weights = pd.read_csv(model_file, sep="\t", nrows=2).loc[1, :]
-        LOGGER.info("Loading the Percolator model.")
-
-        weight_cols = [c for c in weights.index if c != "m0"]
-        model = Model(estimator=LinearSVC(), scaler=StandardScaler())
-        weight_vals = weights.loc[weight_cols]
-        weight_vals = weight_vals[np.newaxis, :]
-        model.estimator.coef_ = weight_vals
-        model.estimator.intercept_ = weights.loc["m0"]
-        model.features = weight_cols
-        model.is_trained = True
-
-    # Then try loading it with pickle:
-    except (KeyError, UnicodeDecodeError):
-        LOGGER.info("Loading mokapot model.")
-        with open(model_file, "rb") as mod_in:
-            model = pickle.load(mod_in)
-
-    return model
+    models = load_models(model_file)
+    if len(models) > 1:
+        LOGGER.info(
+            "Loaded %i models from '%s'; returning the first model.",
+            len(models),
+            model_file,
+        )
+    return models[0]
 
 
 # Private Functions -----------------------------------------------------------
+def _extract_weight_rows(
+    model: Model,
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """Extract normalized and raw weights for Percolator-style output."""
+    if not model.is_trained:
+        raise ValueError("Can only save trained models.")
+
+    if model.features is None:
+        raise ValueError("Model has no feature names.")
+
+    features = list(model.features)
+    try:
+        weights = np.asarray(model.estimator.coef_, dtype=float).reshape(-1)
+        intercept = float(np.asarray(model.estimator.intercept_)[0])
+    except (AttributeError, IndexError, ValueError) as exc:
+        raise ValueError(
+            "Model does not expose linear coefficients/intercept."
+        ) from exc
+
+    if len(weights) != len(features):
+        raise ValueError(
+            "The number of model coefficients does not match the number of "
+            "features."
+        )
+
+    norm_row = np.concatenate([weights, np.array([intercept])])
+    raw_weights, raw_intercept = _unnormalize_weights(weights, intercept, model)
+    raw_row = np.concatenate([raw_weights, np.array([raw_intercept])])
+    return features, norm_row, raw_row
+
+
+def _unnormalize_weights(
+    weights: np.ndarray, intercept: float, model: Model
+) -> tuple[np.ndarray, float]:
+    """Unnormalize coefficients based on the fitted model scaler."""
+    scaler = model.scaler
+    if isinstance(scaler, DummyScaler):
+        return weights.copy(), intercept
+
+    if isinstance(scaler, StandardScaler):
+        try:
+            mean = np.asarray(scaler.mean_, dtype=float)
+            scale = np.asarray(scaler.scale_, dtype=float)
+        except AttributeError as exc:
+            raise ValueError(
+                "The model scaler is missing mean_/scale_ attributes."
+            ) from exc
+
+        if len(mean) != len(weights) or len(scale) != len(weights):
+            raise ValueError(
+                "Scaler mean_/scale_ length does not match model features."
+            )
+
+        safe_scale = np.where(scale == 0, 1.0, scale)
+        raw_weights = weights / safe_scale
+        raw_intercept = intercept - np.sum(weights * mean / safe_scale)
+        return raw_weights, float(raw_intercept)
+
+    LOGGER.warning(
+        "Scaler type '%s' is not supported for unnormalizing model weights. "
+        "Using normalized values as raw values.",
+        type(scaler).__name__,
+    )
+    return weights.copy(), intercept
+
+
+def _format_weight_row(weights: np.ndarray) -> str:
+    """Format one line of model weights for Percolator output."""
+    return "\t".join([f"{weight:.4f}" for weight in weights])
+
+
+def _load_percolator_models(model_file: Path) -> list[Model]:
+    """Load one or more models from a Percolator-style weights file."""
+    blocks = _parse_percolator_weight_blocks(model_file)
+    models = []
+    for fold, (features, _, raw_weights) in enumerate(blocks):
+        model = Model(estimator=LinearSVC(), scaler="as-is")
+        model.estimator.coef_ = raw_weights[:-1][np.newaxis, :]
+        model.estimator.intercept_ = np.array([raw_weights[-1]])
+        model.features = features
+        model.is_trained = True
+        model.fold = fold
+        model.override = True
+        model.feat_pass = 0
+        model.desc = True
+        models.append(model)
+    return models
+
+
+def _parse_percolator_weight_blocks(
+    model_file: Path,
+) -> list[tuple[list[str], np.ndarray, np.ndarray]]:
+    """
+    Parse a Percolator-style model weights file.
+
+    Returns blocks of (feature_names, normalized_weights, raw_weights).
+    """
+    parsed_lines = []
+    with open(model_file, "r", encoding="utf-8") as stream:
+        for line_no, line in enumerate(stream, start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parsed_lines.append((line_no, stripped.split("\t")))
+
+    if not parsed_lines:
+        raise PercolatorWeightsParseError(
+            f"No Percolator weight data found in '{model_file}'."
+        )
+
+    blocks = []
+    idx = 0
+    while idx < len(parsed_lines):
+        line_no, header = parsed_lines[idx]
+        if not _is_weights_header(header):
+            raise PercolatorWeightsParseError(
+                f"Expected a Percolator header ending with 'm0' at line "
+                f"{line_no} in '{model_file}'."
+            )
+        features = header[:-1]
+        if not features:
+            raise PercolatorWeightsParseError(
+                f"No features found in header at line {line_no} in "
+                f"'{model_file}'."
+            )
+
+        idx += 1
+        if idx >= len(parsed_lines):
+            raise PercolatorWeightsParseError(
+                f"Missing normalized weights after header at line {line_no} "
+                f"in '{model_file}'."
+            )
+
+        norm_line_no, norm_tokens = parsed_lines[idx]
+        if _is_weights_header(norm_tokens):
+            raise PercolatorWeightsParseError(
+                f"Missing normalized weights at line {norm_line_no} in "
+                f"'{model_file}'."
+            )
+        norm_weights = _parse_weights_row(
+            tokens=norm_tokens,
+            expected_len=len(header),
+            line_no=norm_line_no,
+            model_file=model_file,
+        )
+        idx += 1
+
+        raw_weights = norm_weights.copy()
+        if idx < len(parsed_lines):
+            raw_line_no, raw_tokens = parsed_lines[idx]
+            if not _is_weights_header(raw_tokens):
+                raw_weights = _parse_weights_row(
+                    tokens=raw_tokens,
+                    expected_len=len(header),
+                    line_no=raw_line_no,
+                    model_file=model_file,
+                )
+                idx += 1
+
+        blocks.append((features, norm_weights, raw_weights))
+
+    return blocks
+
+
+def _is_weights_header(tokens: list[str]) -> bool:
+    """Check whether a tokenized line looks like a Percolator header."""
+    return bool(tokens) and tokens[-1] == "m0"
+
+
+def _parse_weights_row(
+    tokens: list[str], expected_len: int, line_no: int, model_file: Path
+) -> np.ndarray:
+    """Parse one numeric row in a Percolator weights file."""
+    if len(tokens) != expected_len:
+        raise PercolatorWeightsParseError(
+            f"Expected {expected_len} columns at line {line_no} in "
+            f"'{model_file}', got {len(tokens)}."
+        )
+    try:
+        return np.asarray([float(token) for token in tokens], dtype=float)
+    except ValueError as exc:
+        raise PercolatorWeightsParseError(
+            f"Non-numeric value found at line {line_no} in '{model_file}'."
+        ) from exc
+
+
 def _get_starting_labels(dataset: LinearPsmDataset, model):
     """
     Get labels using the initial direction.

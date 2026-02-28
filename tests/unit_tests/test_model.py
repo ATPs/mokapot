@@ -173,3 +173,67 @@ def test_dummy_scaler():
     scaler = mokapot.model.DummyScaler()
     assert (data == scaler.fit_transform(data)).all()
     assert (data == scaler.transform(data)).all()
+
+
+def test_load_models_percolator_weights(tmp_path):
+    """Test parsing Percolator-style weights files."""
+    model_file = tmp_path / "weights.txt"
+    model_file.write_text(
+        "# This file contains Percolator weights\n"
+        "# Header + normalized + raw for each fold\n"
+        "# Repeated per fold\n"
+        "feat_a\tfeat_b\tm0\n"
+        "0.1000\t0.2000\t0.3000\n"
+        "1.1000\t1.2000\t1.3000\n"
+        "feat_a\tfeat_b\tm0\n"
+        "0.4000\t0.5000\t0.6000\n"
+        "1.4000\t1.5000\t1.6000\n"
+    )
+
+    loaded = mokapot.load_models(model_file)
+    assert len(loaded) == 2
+    assert isinstance(loaded[0].scaler, mokapot.model.DummyScaler)
+    assert loaded[0].features == ["feat_a", "feat_b"]
+    np.testing.assert_allclose(loaded[0].estimator.coef_, [[1.1, 1.2]])
+    np.testing.assert_allclose(loaded[0].estimator.intercept_, [1.3])
+    np.testing.assert_allclose(loaded[1].estimator.coef_, [[1.4, 1.5]])
+    np.testing.assert_allclose(loaded[1].estimator.intercept_, [1.6])
+
+
+def test_save_percolator_models_roundtrip(tmp_path):
+    """Test writing Percolator-style weights and loading them back."""
+    model_a = mokapot.Model(LinearSVC(), scaler="as-is")
+    model_a.features = ["feat_a", "feat_b"]
+    model_a.estimator.coef_ = np.array([[2.0, 4.0]])
+    model_a.estimator.intercept_ = np.array([5.0])
+    model_a.is_trained = True
+
+    model_b = mokapot.Model(LinearSVC())
+    model_b.features = ["feat_a", "feat_b"]
+    model_b.estimator.coef_ = np.array([[2.0, 4.0]])
+    model_b.estimator.intercept_ = np.array([5.0])
+    model_b.scaler.mean_ = np.array([1.0, 2.0])
+    model_b.scaler.scale_ = np.array([2.0, 4.0])
+    model_b.is_trained = True
+
+    model_file = tmp_path / "weights.txt"
+    mokapot.save_percolator_models([model_a, model_b], model_file)
+
+    lines = model_file.read_text().splitlines()
+    assert lines[0].startswith("# This file contains the weights")
+    assert lines[1].startswith("# First line is the feature names")
+    assert lines[2].startswith("# This is repeated")
+    assert lines[3] == "feat_a\tfeat_b\tm0"
+    assert lines[6] == "feat_a\tfeat_b\tm0"
+    assert len(lines) == 9
+
+    loaded = mokapot.load_models(model_file)
+    assert len(loaded) == 2
+
+    # Raw weights for the first model are unchanged ("as-is" scaler).
+    np.testing.assert_allclose(loaded[0].estimator.coef_, [[2.0, 4.0]])
+    np.testing.assert_allclose(loaded[0].estimator.intercept_, [5.0])
+
+    # Raw weights for StandardScaler are unnormalized before writing.
+    np.testing.assert_allclose(loaded[1].estimator.coef_, [[1.0, 1.0]])
+    np.testing.assert_allclose(loaded[1].estimator.intercept_, [2.0])
