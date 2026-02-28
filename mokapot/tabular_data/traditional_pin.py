@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from mokapot.utils import open_file
+
 
 def is_traditional_pin(path: Path) -> bool:
     """Check if the PIN file is a traditional PIN file.
@@ -32,7 +34,7 @@ def is_traditional_pin(path: Path) -> bool:
     ValueError
         If the PIN file is not a PIN file. (or is corrupted)
     """
-    with open(path) as f:
+    with open_file(path, mode="rt") as f:
         nread = 0
         header = f.readline().strip()
         nread += 1
@@ -91,7 +93,7 @@ def read_traditional_pin(path) -> pd.DataFrame:
 
     out_lines = []
 
-    with open(path) as f:
+    with open_file(path, mode="rt") as f:
         for line in f:
             line = line.strip()
             if line.startswith("#"):

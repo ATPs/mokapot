@@ -44,7 +44,19 @@ class CSVFileReader(TabularDataReader):
 
     def get_column_types(self) -> list[np.dtype]:
         df = pd.read_csv(self.file_name, **self.stdargs, nrows=2)
-        return df.dtypes.tolist()
+        out = []
+        for dtype in df.dtypes.tolist():
+            numpy_dtype = getattr(dtype, "numpy_dtype", None)
+            if numpy_dtype is not None:
+                out.append(np.dtype(numpy_dtype))
+                continue
+
+            try:
+                out.append(np.dtype(dtype))
+            except TypeError:
+                out.append(np.dtype("O"))
+
+        return out
 
     def read(self, columns: list[str] | None = None) -> pd.DataFrame:
         result = pd.read_csv(self.file_name, usecols=columns, **self.stdargs)

@@ -250,9 +250,21 @@ def drop_missing_values_and_fill_spectra_dataframe(
         ):  # Isnt this a constant within the function?
             df_spectra_list.append(feature[spectra])
             with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore", category=pd.errors.SettingWithCopyWarning
+                setting_with_copy_warning = getattr(
+                    pd.errors, "SettingWithCopyWarning", None
                 )
+                if setting_with_copy_warning is not None:
+                    warnings.filterwarnings(
+                        "ignore", category=setting_with_copy_warning
+                    )
+
+                chained_assignment_warning = getattr(
+                    pd.errors, "ChainedAssignmentError", None
+                )
+                if chained_assignment_warning is not None:
+                    warnings.filterwarnings(
+                        "ignore", category=chained_assignment_warning
+                    )
                 feature.drop(spectra, axis=1, inplace=True)
         na_mask = pd.concat(
             [na_mask, pd.DataFrame([feature.isna().any(axis=0)])],

@@ -101,6 +101,11 @@ class JoinedTabularDataReader(TabularDataReader):
                     raise RuntimeError(msg)
                 yield df[columns]
 
+    def get_default_extension(self) -> str:
+        if not self.readers:
+            return ".tsv"
+        return self.readers[0].get_default_extension()
+
 
 @typechecked
 class ComputedTabularDataReader(TabularDataReader):
@@ -174,6 +179,9 @@ class ComputedTabularDataReader(TabularDataReader):
             if columns is None or self.column in columns:
                 df[self.column] = self.func(df)
             yield df if columns is None else df[columns]
+
+    def get_default_extension(self) -> str:
+        return self.reader.get_default_extension()
 
 
 @typechecked
@@ -351,6 +359,9 @@ class MergedTabularDataReader(TabularDataReader):
         df = pd.concat(rows)
         df.reset_index(drop=True, inplace=True)
         return df
+
+    def get_default_extension(self) -> str:
+        return self.readers[0].get_default_extension()
 
 
 @typechecked

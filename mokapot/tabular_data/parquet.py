@@ -107,7 +107,20 @@ class ParquetFileReader(TabularDataReader):
     def get_column_types(self) -> list[np.dtype]:
         schema = pq.ParquetFile(self.file_name).schema
         pq_types = schema.to_arrow_schema().types
-        return [np.dtype(type.to_pandas_dtype()) for type in pq_types]
+        out = []
+        for type in pq_types:
+            pandas_dtype = type.to_pandas_dtype()
+            numpy_dtype = getattr(pandas_dtype, "numpy_dtype", None)
+            if numpy_dtype is not None:
+                out.append(np.dtype(numpy_dtype))
+                continue
+
+            try:
+                out.append(np.dtype(pandas_dtype))
+            except TypeError:
+                out.append(np.dtype("O"))
+
+        return out
 
     def read(self, columns: list[str] | None = None) -> pd.DataFrame:
         result = pq.read_table(self.file_name, columns=columns).to_pandas()

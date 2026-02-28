@@ -47,6 +47,14 @@ PARQUET_SUFFIXES = [".parquet"]
 SQLITE_SUFFIXES = [".db"]
 
 
+def _get_reader_suffix(file_name: Path) -> str:
+    """Get the data suffix while ignoring a trailing compression suffix."""
+    suffixes = file_name.suffixes
+    if len(suffixes) >= 2 and suffixes[-1] == ".gz":
+        return suffixes[-2]
+    return file_name.suffix
+
+
 @typechecked
 def reader_from_path(
     file_name: Path,
@@ -58,7 +66,7 @@ def reader_from_path(
     # could also look into the file itself (is it ascii? does it have
     # some "magic bytes"? ...)
 
-    suffix = file_name.suffix
+    suffix = _get_reader_suffix(file_name)
     if suffix in PIN_SUFFIXES:
         reader = None
         try:

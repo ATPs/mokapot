@@ -13,11 +13,11 @@ from typeguard import typechecked
 
 
 @typechecked
-def open_file(file_name: Path):
+def open_file(file_name: Path, mode: str = "rt", **kwargs):
     if file_name.suffix == ".gz":
-        return gzip.open(file_name)
+        return gzip.open(file_name, mode=mode, **kwargs)
     else:
-        return open(file_name)
+        return open(file_name, mode=mode, **kwargs)
 
 
 def groupby_max(df, by_cols, max_col, rng):

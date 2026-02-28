@@ -7,9 +7,13 @@ from numpy import dtype
 
 from mokapot.tabular_data import (
     ColumnMappedReader,
+    ColumnSelectReader,
+    ComputedTabularDataReader,
     CSVFileReader,
     CSVFileWriter,
     DataFrameReader,
+    JoinedTabularDataReader,
+    MergedTabularDataReader,
     ParquetFileReader,
     TabularDataReader,
     auto_finalize,
@@ -244,6 +248,49 @@ def test_column_renaming(psm_df_6):
         )
     )
     assert (renamed_chunk.values == orig_chunk.values).all()
+
+
+def test_default_extension_forwarding(tmp_path):
+    csv_path = tmp_path / "ext_test.tsv"
+    pd.DataFrame({"a": [1, 2], "b": [3, 4]}).to_csv(
+        csv_path, sep="\t", index=False
+    )
+    csv_reader = TabularDataReader.from_path(csv_path)
+    assert csv_reader.get_default_extension() == ".tsv"
+
+    mapped = ColumnMappedReader(csv_reader, {"a": "A"})
+    assert mapped.get_default_extension() == ".tsv"
+
+    selected = ColumnSelectReader(csv_reader, ["a"])
+    assert selected.get_default_extension() == ".tsv"
+
+    computed = ComputedTabularDataReader(
+        reader=csv_reader,
+        column="c",
+        dtype=np.dtype("int64"),
+        func=lambda df: df["a"] + df["b"],
+    )
+    assert computed.get_default_extension() == ".tsv"
+
+    joined = JoinedTabularDataReader([csv_reader, selected])
+    assert joined.get_default_extension() == ".tsv"
+
+    sorted1_path = tmp_path / "sorted1.tsv"
+    sorted2_path = tmp_path / "sorted2.tsv"
+    pd.DataFrame({"score": [2.0, 1.0], "x": [10, 11]}).to_csv(
+        sorted1_path, sep="\t", index=False
+    )
+    pd.DataFrame({"score": [1.5, 0.5], "x": [12, 13]}).to_csv(
+        sorted2_path, sep="\t", index=False
+    )
+    merged = MergedTabularDataReader(
+        readers=[
+            TabularDataReader.from_path(sorted1_path),
+            TabularDataReader.from_path(sorted2_path),
+        ],
+        priority_column="score",
+    )
+    assert merged.get_default_extension() == ".tsv"
 
 
 # todo: nice to have: tests for writers (CSV, Parquet, buffering) are still

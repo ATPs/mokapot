@@ -68,7 +68,8 @@ def _parser():
         nargs="+",
         help=(
             "A collection of PSMs in the Percolator tab-delimited "
-            "or PepXML format."
+            "or PepXML format. Gzip-compressed Percolator tab-delimited "
+            "files (e.g., .pin.gz, .tsv.gz) are supported."
         ),
     )
 

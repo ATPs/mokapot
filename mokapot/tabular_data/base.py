@@ -21,6 +21,26 @@ class BufferType(Enum):
     Dicts = "Dicts"
 
 
+def _to_numpy_dtype(dtype_like) -> np.dtype:
+    """
+    Convert pandas/numpy dtype-like values into numpy dtypes.
+
+    Pandas extension dtypes (e.g. StringDtype) are mapped to the closest
+    numpy-compatible dtype for downstream compatibility checks.
+    """
+    if isinstance(dtype_like, np.dtype):
+        return dtype_like
+
+    numpy_dtype = getattr(dtype_like, "numpy_dtype", None)
+    if numpy_dtype is not None:
+        return np.dtype(numpy_dtype)
+
+    try:
+        return np.dtype(dtype_like)
+    except TypeError:
+        return np.dtype("O")
+
+
 @typechecked
 class TabularDataReader(ABC):
     """
@@ -141,6 +161,9 @@ class ColumnSelectReader(TabularDataReader):
             columns=self.selected_columns or columns,
         )
 
+    def get_default_extension(self) -> str:
+        return self.reader.get_default_extension()
+
 
 @typechecked
 class ColumnMappedReader(TabularDataReader):
@@ -202,6 +225,9 @@ class ColumnMappedReader(TabularDataReader):
         ):
             yield self._get_mapped_dataframe(chunk)
 
+    def get_default_extension(self) -> str:
+        return self.reader.get_default_extension()
+
 
 @typechecked
 class DataFrameReader(TabularDataReader):
@@ -230,7 +256,7 @@ class DataFrameReader(TabularDataReader):
         return self.df.columns.tolist()
 
     def get_column_types(self) -> list[np.dtype]:
-        return self.df.dtypes.tolist()
+        return [_to_numpy_dtype(dtype) for dtype in self.df.dtypes.tolist()]
 
     def read(self, columns: list[str] | None = None) -> pd.DataFrame:
         return self.df if columns is None else self.df[columns]
@@ -244,6 +270,9 @@ class DataFrameReader(TabularDataReader):
 
     def _returned_dataframe_is_mutable(self):
         return False
+
+    def get_default_extension(self) -> str:
+        return ".tsv"
 
 
 @typechecked
@@ -291,7 +320,9 @@ class TabularDataWriter(ABC):
             )
 
         if self.column_types is not None:
-            column_types = data.dtypes.tolist()
+            column_types = [
+                _to_numpy_dtype(dtype) for dtype in data.dtypes.tolist()
+            ]
             for own_type, other_type in zip(self.column_types, column_types):
                 if not np.can_cast(own_type, other_type, "same_kind"):
                     raise ValueError(
