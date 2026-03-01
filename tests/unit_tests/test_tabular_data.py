@@ -1,3 +1,4 @@
+import gzip
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,7 @@ from mokapot.tabular_data import (
     TabularDataReader,
     auto_finalize,
 )
+from mokapot.tabular_data.traditional_pin import TraditionalPINReader
 
 
 def test_from_path(tmp_path):
@@ -97,6 +99,43 @@ def test_csv_file_reader(file_use):
     assert sizes == [20000, 20000, 15398]
     df_from_chunks = pd.concat(chunks)
     assert all(df_from_chunks.index == range(len(df_from_chunks)))
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_traditional_pin_reader_chunked_matches_full(tmp_path, compressed):
+    pin_path = tmp_path / "small.traditional.pin"
+    with open(pin_path, "w+", encoding="utf-8") as pin:
+        pin.write(
+            "SpecId\tLabel\tPeptide\tScore\tScanNr\tProteins\n"
+            "a\t1\tABC\t5.0\t2\tprotein1\tprotein2\n"
+            "b\t-1\tDEF\t1.5\t3\tdecoy_protein1\tdecoy_protein2\n"
+            "c\t1\tGHI\t2.5\t4\tprotein3\n"
+        )
+
+    reader_path = pin_path
+    if compressed:
+        gz_path = tmp_path / "small.traditional.pin.gz"
+        with open(pin_path, "rb") as in_ref, gzip.open(gz_path, "wb") as out_ref:
+            out_ref.write(in_ref.read())
+        reader_path = gz_path
+
+    reader = TabularDataReader.from_path(reader_path)
+    assert isinstance(reader, TraditionalPINReader)
+
+    selected_columns = ["SpecId", "ScanNr", "Proteins", "Label", "Score"]
+    full = reader.read(columns=selected_columns)
+    chunks = list(
+        reader.get_chunked_data_iterator(chunk_size=2, columns=selected_columns)
+    )
+    from_chunks = pd.concat(chunks)
+
+    assert all(from_chunks.index == range(len(from_chunks)))
+    assert full["Proteins"].tolist() == [
+        "protein1:protein2",
+        "decoy_protein1:decoy_protein2",
+        "protein3",
+    ]
+    pd.testing.assert_frame_equal(from_chunks, full)
 
 
 def test_parquet_file_reader():

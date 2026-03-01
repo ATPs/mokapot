@@ -117,6 +117,33 @@ def test_traditional_pin_parsing_gz(traditional_pin, tmp_path):
     ]
 
 
+def test_traditional_pin_parsing_plain(traditional_pin):
+    """Test traditional pin parsing from plain text input."""
+    datasets = mokapot.read_pin(traditional_pin, max_workers=4)
+    protein_column = datasets[0].column_groups.optional_columns.protein
+    proteins = datasets[0].read_data(columns=[protein_column])[protein_column]
+    assert proteins.tolist() == [
+        "protein1:protein2",
+        "decoy_protein1:decoy_protein2",
+    ]
+
+
+def test_missing_feature_values_are_dropped(tmp_path):
+    """A feature with at least one missing value should be dropped."""
+    pin_file = tmp_path / "missing_feature.pin"
+    with open(pin_file, "w+", encoding="utf-8") as pin:
+        pin.write(
+            "SpecId\tLabel\tPeptide\tScanNr\tfeature_keep\tfeature_drop\tProteins\n"
+            "a\t1\tABC\t1\t0.5\t1.0\tprotein1\n"
+            "b\t-1\tXYZ\t2\t0.1\t\tdecoy_protein1\n"
+        )
+
+    datasets = mokapot.read_pin(pin_file, max_workers=2)
+    dataset = datasets[0]
+    assert "feature_keep" in dataset.feature_columns
+    assert "feature_drop" not in dataset.feature_columns
+
+
 def test_parse_in_chunks_matches_expected_rows():
     datasets = mokapot.read_pin(Path("data", "scope2_FP97AA.pin"), max_workers=2)
     dataset = datasets[0]

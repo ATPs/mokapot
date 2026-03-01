@@ -8,7 +8,6 @@ from mokapot.tabular_data.base import (
     BufferType,
     ColumnMappedReader,
     ColumnSelectReader,
-    DataFrameReader,
     TabularDataReader,
     TabularDataWriter,
 )
@@ -25,8 +24,8 @@ from mokapot.tabular_data.streaming import (
     BufferedWriter,
 )
 from mokapot.tabular_data.traditional_pin import (
+    TraditionalPINReader,
     is_traditional_pin,
-    read_traditional_pin,
 )
 
 CSV_SUFFIXES = [
@@ -71,7 +70,7 @@ def reader_from_path(
         reader = None
         try:
             if is_traditional_pin(file_name):
-                reader = DataFrameReader(read_traditional_pin(file_name))
+                reader = TraditionalPINReader(file_name, **kwargs)
         except ValueError as e:
             msg = "Deprecation warning: Passing files with a .pin extesion"
             msg += " that are not compliant with the format specification"

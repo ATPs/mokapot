@@ -3,11 +3,11 @@ This module contains the parsers for reading in PSMs
 """
 
 import logging
-import warnings
 from pathlib import Path
 from pprint import pformat
-from typing import Iterable, List
+from typing import Iterable
 
+import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 from typeguard import typechecked
@@ -16,19 +16,18 @@ from mokapot.column_defs import (
     ColumnGroups,
 )
 from mokapot.constants import (
-    CHUNK_SIZE_COLUMNS_FOR_DROP_COLUMNS,
     CHUNK_SIZE_ROWS_FOR_DROP_COLUMNS,
 )
 from mokapot.dataset import OnDiskPsmDataset, PsmDataset
 from mokapot.tabular_data import TabularDataReader
 from mokapot.utils import (
-    create_chunks,
-    flatten,
     make_bool_trarget,
     tuplize,
 )
 
 LOGGER = logging.getLogger(__name__)
+IMPORT_SCAN_CELL_BUDGET = 8_000_000
+IMPORT_SCAN_MIN_ROWS = 50_000
 
 
 # Functions -------------------------------------------------------------------
@@ -114,29 +113,6 @@ def read_pin(
     ]
 
 
-def create_chunks_with_identifier(data, identifier_column, chunk_size):
-    """
-    This function will split data into chunks but will make sure that
-    identifier_columns is never split
-
-    Parameters
-    ----------
-    data: the data you want to split in chunks (1d list)
-    identifier_column: columns that should never be splitted.
-        Must be of length 2.
-    chunk_size: the chunk size
-
-    Returns
-    -------
-
-    """
-    if (len(data) + len(identifier_column)) % chunk_size != 1:
-        data_copy = data + identifier_column
-        return create_chunks(data_copy, chunk_size)
-    else:
-        return create_chunks(data, chunk_size) + [identifier_column]
-
-
 def read_percolator(
     perc_file: Path,
     max_workers,
@@ -178,34 +154,19 @@ def read_percolator(
     spectra = prelim_columns.spectrum_columns
     labels = prelim_columns.target_column
 
-    # Check that features don't have missing values:
-    feat_slices = create_chunks_with_identifier(
-        data=list(features),
-        identifier_column=list(spectra + (labels,)),
-        chunk_size=CHUNK_SIZE_COLUMNS_FOR_DROP_COLUMNS,
+    # Check that features don't have missing values in a single chunked pass.
+    df_spectra, features_to_drop = _scan_spectra_and_missing_features(
+        reader=reader,
+        features=features,
+        spectra=spectra,
+        target_column=labels,
     )
-    df_spectra_list = []
-    # Q: this really feels like a bad idea ... concurrent mutation of a list
-    # .  where the elements are concrruently mutated datafames in-place.
-    features_to_drop = Parallel(n_jobs=max_workers, require="sharedmem")(
-        delayed(drop_missing_values_and_fill_spectra_dataframe)(
-            reader=reader,
-            column=c,
-            spectra=list(spectra + (labels,)),
-            df_spectra_list=df_spectra_list,
-        )
-        for c in feat_slices
-    )
-
-    df_spectra = pd.concat(df_spectra_list)
     tmp_labels = make_bool_trarget(df_spectra.loc[:, labels])
     # Deleting the column solves a deprecation warning that mentions
     # "assiging column with incompatible dtype"
     del df_spectra[labels]
     df_spectra.loc[:, labels] = tmp_labels
 
-    features_to_drop = [drop for drop in features_to_drop if drop]
-    features_to_drop = flatten(features_to_drop)
     if len(features_to_drop) > 1:
         LOGGER.warning("Missing values detected in the following features:")
         for col in features_to_drop:
@@ -220,7 +181,7 @@ def read_percolator(
     for i, feat in enumerate(_feature_columns):
         LOGGER.info("  (%i)\t%s", i + 0, feat)
 
-    prelim_columns.update(
+    prelim_columns = prelim_columns.update(
         feature_columns=_feature_columns,
     )
     column_groups = prelim_columns
@@ -234,46 +195,55 @@ def read_percolator(
 
 
 # Utility Functions -----------------------------------------------------------
-def drop_missing_values_and_fill_spectra_dataframe(
-    reader: TabularDataReader,
-    column: List,
-    spectra: List,
-    df_spectra_list: List[pd.DataFrame],
-):
-    na_mask = pd.DataFrame([], columns=list(set(column) - set(spectra)))
-    file_iterator = reader.get_chunked_data_iterator(
-        chunk_size=CHUNK_SIZE_ROWS_FOR_DROP_COLUMNS, columns=column
-    )
-    for i, feature in enumerate(file_iterator):
-        if set(spectra) <= set(
-            column
-        ):  # Isnt this a constant within the function?
-            df_spectra_list.append(feature[spectra])
-            with warnings.catch_warnings():
-                setting_with_copy_warning = getattr(
-                    pd.errors, "SettingWithCopyWarning", None
-                )
-                if setting_with_copy_warning is not None:
-                    warnings.filterwarnings(
-                        "ignore", category=setting_with_copy_warning
-                    )
+def _get_adaptive_import_chunk_size(
+    n_requested_columns: int,
+) -> int:
+    if CHUNK_SIZE_ROWS_FOR_DROP_COLUMNS < 1:
+        raise ValueError("CHUNK_SIZE_ROWS_FOR_DROP_COLUMNS must be >= 1.")
 
-                chained_assignment_warning = getattr(
-                    pd.errors, "ChainedAssignmentError", None
-                )
-                if chained_assignment_warning is not None:
-                    warnings.filterwarnings(
-                        "ignore", category=chained_assignment_warning
-                    )
-                feature.drop(spectra, axis=1, inplace=True)
-        na_mask = pd.concat(
-            [na_mask, pd.DataFrame([feature.isna().any(axis=0)])],
-            ignore_index=True,
-        )
-    del file_iterator
-    na_mask = na_mask.any(axis=0)
-    if na_mask.any():
-        return list(na_mask[na_mask].index)
+    if n_requested_columns < 1:
+        return CHUNK_SIZE_ROWS_FOR_DROP_COLUMNS
+
+    rows_from_budget = max(
+        IMPORT_SCAN_MIN_ROWS,
+        IMPORT_SCAN_CELL_BUDGET // n_requested_columns,
+    )
+    return max(
+        1,
+        min(CHUNK_SIZE_ROWS_FOR_DROP_COLUMNS, rows_from_budget),
+    )
+
+
+def _scan_spectra_and_missing_features(
+    reader: TabularDataReader,
+    features: tuple[str, ...],
+    spectra: tuple[str, ...],
+    target_column: str,
+) -> tuple[pd.DataFrame, list[str]]:
+    spectra_columns = list(spectra + (target_column,))
+    scan_columns = list(dict.fromkeys(spectra_columns + list(features)))
+    chunk_size = _get_adaptive_import_chunk_size(len(scan_columns))
+    feature_na_mask = np.zeros(len(features), dtype=bool)
+    spectra_chunks: list[pd.DataFrame] = []
+
+    file_iterator = reader.get_chunked_data_iterator(
+        chunk_size=chunk_size,
+        columns=scan_columns,
+    )
+    for chunk in file_iterator:
+        spectra_chunks.append(chunk[spectra_columns])
+        if len(features):
+            feature_na_mask |= chunk[list(features)].isna().any(axis=0).to_numpy()
+
+    if spectra_chunks:
+        df_spectra = pd.concat(spectra_chunks)
+    else:
+        df_spectra = pd.DataFrame(columns=spectra_columns)
+
+    features_to_drop = [
+        feature for feature, is_na in zip(features, feature_na_mask) if is_na
+    ]
+    return df_spectra, features_to_drop
 
 
 @typechecked
