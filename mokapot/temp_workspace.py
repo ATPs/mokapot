@@ -28,13 +28,28 @@ class TempWorkspace:
         return out
 
     def cleanup(self):
-        if not self.path.exists():
-            return
+        temp_root = self.base_dir / ".mokapot-temp"
         try:
-            shutil.rmtree(self.path, ignore_errors=False)
+            if self.path.exists():
+                shutil.rmtree(self.path, ignore_errors=False)
         except Exception as exc:
             LOGGER.warning(
                 "Failed to remove temporary workspace '%s': %s",
                 self.path,
+                exc,
+            )
+            return
+
+        # Remove the shared temp root when this run was the last workspace.
+        try:
+            if temp_root.exists():
+                temp_root.rmdir()
+        except OSError:
+            # Parent is not empty (other runs/artifacts still exist).
+            pass
+        except Exception as exc:
+            LOGGER.warning(
+                "Failed to remove temporary root '%s': %s",
+                temp_root,
                 exc,
             )
