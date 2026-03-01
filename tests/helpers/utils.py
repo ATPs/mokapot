@@ -175,7 +175,14 @@ class ColumnValidator:
             msg += f" ({num_missing}/{tot_col})"
             fails.append(msg)
 
-        if series.dtype != self.col_type:
+        if self.col_type in ("O", "object"):
+            type_matches = pd.api.types.is_object_dtype(
+                series.dtype
+            ) or pd.api.types.is_string_dtype(series.dtype)
+        else:
+            type_matches = series.dtype == self.col_type
+
+        if not type_matches:
             fails.append(
                 f"Type {series.dtype} != {self.col_type} at col: '{self.name}'"
             )
