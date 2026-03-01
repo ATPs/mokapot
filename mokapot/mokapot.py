@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from . import __version__
-from .brew import brew
+from .brew import brew, resolve_parallelism
 from .confidence import assign_confidence
 from .config import Config
 from .model import (
@@ -99,6 +99,17 @@ def main(main_args=None):
     else:
         proteins = None
 
+    outer_workers, inner_workers = resolve_parallelism(
+        max_workers=config.max_workers,
+        folds=config.folds,
+        model_n_jobs=config.model_n_jobs,
+    )
+    logging.debug(
+        "Resolved parallelism: outer_workers=%d, model_n_jobs=%d",
+        outer_workers,
+        inner_workers,
+    )
+
     # Define a model:
     model = None
     if config.load_models:
@@ -116,6 +127,7 @@ def main(main_args=None):
             max_iter=config.max_iter,
             direction=config.direction,
             override=config.override,
+            n_jobs=inner_workers,
             rng=config.seed,
         )
 
@@ -125,7 +137,7 @@ def main(main_args=None):
         model=model,
         test_fdr=config.test_fdr,
         folds=config.folds,
-        max_workers=config.max_workers,
+        max_workers=outer_workers,
         subset_max_train=config.subset_max_train,
         ensemble=config.ensemble,
         rng=config.seed,

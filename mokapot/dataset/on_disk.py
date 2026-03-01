@@ -133,10 +133,11 @@ class OnDiskPsmDataset(PsmDataset):
         # todo: nice to have: here reader.file_name should be something like
         #   reader.user_repr() which tells the user where to look for the
         #   error, however, we cannot expect the reader to have a file_name
+        reader_columns = self.reader.get_column_names()
+        file_name = getattr(self.reader, "file_name", "<unknown file>")
+
         def check_column(column):
-            reader_columns = self.reader.get_column_names()
             if column and column not in reader_columns:
-                file_name = getattr(self.reader, "file_name", "<unknown file>")
                 raise ValueError(
                     f"Column '{column}' not found in data columns of file"
                     f" '{file_name}' ({reader_columns})"
@@ -382,20 +383,56 @@ class OnDiskPsmDataset(PsmDataset):
                 " dataframe"
                 f" Available columns: {self.spectra_dataframe.columns}"
             )
+        try:
+            return self._split_vectorized(folds, rng)
+        except Exception as err:
+            LOGGER.debug(
+                "Falling back to legacy split implementation: %s",
+                err,
+                exc_info=True,
+            )
+            return self._split_legacy(folds, rng)
+
+    def _split_vectorized(self, folds, rng):
+        spectra = self.spectra_dataframe[list(self.spectrum_columns)]
+        spectra_hash = pd.util.hash_pandas_object(
+            spectra, index=False
+        ).to_numpy()
+        spectra_idx = np.argsort(spectra_hash, kind="mergesort")
+        return self._split_from_sorted_hash(
+            spectra_idx=spectra_idx,
+            spectra_hash_sorted=spectra_hash[spectra_idx],
+            folds=folds,
+            rng=rng,
+        )
+
+    def _split_legacy(self, folds, rng):
         spectra = self.spectra_dataframe[list(self.spectrum_columns)].values
-        # Q: Why is this deleted here? I am assuming memory but its not really
-        #    a massive source of memory usage.
-        # del self.spectra_dataframe
         spectra = np.apply_along_axis(OnDiskPsmDataset._hash_row, 1, spectra)
-
-        # sort values to get start position of unique hashes
         spectra_idx = np.argsort(spectra)
-        spectra = spectra[spectra_idx]
-        idx_start_unique = np.unique(spectra, return_index=True)[1]
-        del spectra
+        return self._split_from_sorted_hash(
+            spectra_idx=spectra_idx,
+            spectra_hash_sorted=spectra[spectra_idx],
+            folds=folds,
+            rng=rng,
+        )
 
+    @staticmethod
+    def _split_from_sorted_hash(
+        spectra_idx: np.ndarray,
+        spectra_hash_sorted: np.ndarray,
+        folds: int,
+        rng,
+    ):
+        if len(spectra_idx) == 0:
+            return [np.array([], dtype=int) for _ in range(folds)]
+
+        idx_start_unique = np.flatnonzero(
+            np.r_[True, spectra_hash_sorted[1:] != spectra_hash_sorted[:-1]]
+        )
         fold_size = len(spectra_idx) // folds
         remainder = len(spectra_idx) % folds
+
         start_split_indices = []
         start_idx = 0
         for i in range(folds - 1):
@@ -405,14 +442,18 @@ class OnDiskPsmDataset(PsmDataset):
 
         # search for smallest index bigger of equal to split index in start
         # indexes of unique groups
-        idx_split = idx_start_unique[
-            np.searchsorted(idx_start_unique, start_split_indices)
-        ]
-        del idx_start_unique
-        spectra_idx = np.split(spectra_idx, idx_split)
-        for indices in spectra_idx:
+        idx_split_positions = np.searchsorted(
+            idx_start_unique,
+            start_split_indices,
+        )
+        idx_split_positions = np.clip(
+            idx_split_positions, 0, len(idx_start_unique) - 1
+        )
+        idx_split = idx_start_unique[idx_split_positions]
+        split_indices = np.split(spectra_idx, idx_split)
+        for indices in split_indices:
             rng.shuffle(indices)
-        return spectra_idx
+        return split_indices
 
     def read_data(
         self,

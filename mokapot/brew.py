@@ -37,6 +37,41 @@ LOGGER = logging.getLogger(__name__)
 
 # Functions -------------------------------------------------------------------
 @typechecked
+def resolve_parallelism(
+    max_workers: int,
+    folds: int,
+    model_n_jobs: int | str = "auto",
+) -> tuple[int, int]:
+    """
+    Resolve fold-level and model-level parallelism settings.
+
+    Parameters
+    ----------
+    max_workers : int
+        Total requested worker budget.
+    folds : int
+        Number of cross-validation folds.
+    model_n_jobs : int | str
+        Model-level job count or ``"auto"``.
+    """
+    if max_workers < 1:
+        raise ValueError("'max_workers' must be >= 1.")
+
+    if folds < 1:
+        raise ValueError("'folds' must be >= 1.")
+
+    outer_workers = min(folds, max_workers)
+    if model_n_jobs == "auto":
+        inner_workers = max(1, max_workers // outer_workers)
+    else:
+        if model_n_jobs < 1:
+            raise ValueError("'model_n_jobs' must be >= 1 or 'auto'.")
+        inner_workers = model_n_jobs
+
+    return outer_workers, inner_workers
+
+
+@typechecked
 def brew(
     datasets: list[PsmDataset],
     model: None | Model | list[Model] = None,
@@ -104,6 +139,11 @@ def brew(
     scores : list[np.array[float]]
         The scores
     """
+    outer_workers, _ = resolve_parallelism(
+        max_workers=max_workers,
+        folds=folds,
+    )
+
     rng = np.random.default_rng(rng)
     if model is None:
         model = PercolatorModel()
@@ -181,10 +221,10 @@ def brew(
             datasets=datasets,
             train_idx=train_sets,
             chunk_size=CHUNK_SIZE_READ_ALL_DATA,
-            max_workers=max_workers,
+            max_workers=outer_workers,
         )
         del train_sets
-        fitted = Parallel(n_jobs=max_workers, require="sharedmem")(
+        fitted = Parallel(n_jobs=outer_workers, require="sharedmem")(
             delayed(_fit_model)(d, datasets, copy.deepcopy(model), f)
             for f, d in enumerate(train_psms)
         )
@@ -203,7 +243,7 @@ def brew(
                 _predict_with_ensemble(
                     dataset=dataset,
                     models=[model],
-                    max_workers=max_workers,
+                    max_workers=outer_workers,
                 ),
                 test_fdr,
             )
@@ -217,7 +257,7 @@ def brew(
                 _predict_with_ensemble(
                     dataset=dataset,
                     models=models,
-                    max_workers=max_workers,
+                    max_workers=outer_workers,
                 )
                 for dataset in datasets
             ]
@@ -245,7 +285,7 @@ def brew(
                     datasets=datasets,
                     models=models,
                     test_fdr=test_fdr,
-                    max_workers=max_workers,
+                    max_workers=outer_workers,
                 )
             )
     else:
@@ -353,20 +393,16 @@ def make_train_sets(
         subset_max_train_per_file[-1] += subset_max_train - sum(
             subset_max_train_per_file
         )
-    chunk_range = 5000000
     for fold_idx in zip(*test_idx):
-        train_idx = [[] for _ in data_size]
+        train_idx = [None for _ in data_size]
         train_idx_size = 0
         for file_idx, idx in enumerate(fold_idx):
             ds = data_size[file_idx]
-            k = 0
-            while k + chunk_range < ds:
-                train_idx[file_idx] += list(
-                    set(range(k, k + chunk_range)) - set(idx)
-                )
-                k += chunk_range
-            train_idx[file_idx] += list(set(range(k, ds)) - set(idx))
-            train_idx_size += len(train_idx[file_idx])
+            mask = np.ones(ds, dtype=bool)
+            mask[np.asarray(idx, dtype=int)] = False
+            train_idx_file = np.flatnonzero(mask)
+            train_idx[file_idx] = train_idx_file
+            train_idx_size += len(train_idx_file)
         if len(subset_max_train_per_file) > 0 and train_idx_size > sum(
             subset_max_train_per_file
         ):
@@ -378,11 +414,11 @@ def make_train_sets(
             for i, current_subset_max_train in enumerate(
                 subset_max_train_per_file
             ):
-                if current_subset_max_train < train_idx_size:
+                if current_subset_max_train < len(train_idx[i]):
                     train_idx[i] = rng.choice(
                         train_idx[i], current_subset_max_train, replace=False
-                    ).tolist()
-        yield train_idx
+                    )
+        yield [idx.tolist() for idx in train_idx]
 
 
 @typechecked
@@ -448,6 +484,7 @@ def _predict(
         scores = []
 
         n_folds = len(models)
+        worker_count = min(max_workers, n_folds)
         fold_scores = [[] for _ in range(n_folds)]
         targets = [[] for _ in range(n_folds)]
         orig_idx = [[] for _ in range(n_folds)]
@@ -475,7 +512,7 @@ def _predict(
             for i, dataset_slice in enumerate(dataset_slices):
                 targets[i].append(dataset_slice.targets)
 
-            Parallel(n_jobs=max_workers, require="sharedmem")(
+            Parallel(n_jobs=worker_count, require="sharedmem")(
                 delayed(predict_fold)(
                     model=models[mod_idx],
                     fold=mod_idx,
@@ -530,6 +567,7 @@ def _predict_with_ensemble(
         was reset or not.
     """
     scores = [[] for _ in range(len(models))]
+    worker_count = min(max_workers, len(models))
     file_iterator = dataset.read_data_chunked(
         columns=dataset.columns, chunk_size=CHUNK_SIZE_ROWS_PREDICTION
     )
@@ -537,7 +575,7 @@ def _predict_with_ensemble(
         linear_dataset = _create_linear_dataset(
             dataset, psms_chunk, enforce_checks=False
         )
-        fold_scores = Parallel(n_jobs=max_workers, require="sharedmem")(
+        fold_scores = Parallel(n_jobs=worker_count, require="sharedmem")(
             delayed(model.predict)(dataset=linear_dataset) for model in models
         )
         [score.append(fs) for score, fs in zip(scores, fold_scores)]

@@ -87,6 +87,12 @@ def test_perc_init():
     assert model.override
 
 
+def test_percolator_model_n_jobs():
+    model = mokapot.PercolatorModel(n_jobs=4)
+    assert model.n_jobs == 4
+    assert model.estimator.n_jobs == 4
+
+
 def test_model_fit(psms_dataset):
     """Test that model fitting works"""
     model = mokapot.Model(LogisticRegression(), train_fdr=0.05, max_iter=1)

@@ -3,10 +3,13 @@
 import gzip
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
 import mokapot
+from mokapot.parsers.pin import parse_in_chunks
+from mokapot.utils import make_bool_trarget
 
 
 @pytest.fixture
@@ -112,3 +115,33 @@ def test_traditional_pin_parsing_gz(traditional_pin, tmp_path):
         "protein1:protein2",
         "decoy_protein1:decoy_protein2",
     ]
+
+
+def test_parse_in_chunks_matches_expected_rows():
+    datasets = mokapot.read_pin(Path("data", "scope2_FP97AA.pin"), max_workers=2)
+    dataset = datasets[0]
+    num_rows = len(dataset.spectra_dataframe)
+    all_idx = np.arange(num_rows)
+    train_idx = [
+        [all_idx[all_idx % 3 != fold].tolist()] for fold in range(3)
+    ]
+
+    parsed = parse_in_chunks(
+        datasets=datasets,
+        train_idx=train_idx,
+        chunk_size=17,
+        max_workers=2,
+    )
+
+    full_df = dataset.read_data(columns=dataset.columns)
+    for fold, parsed_df in enumerate(parsed):
+        expected_idx = train_idx[fold][0]
+        expected_df = full_df.iloc[expected_idx].copy()
+        expected_df[dataset.target_column] = make_bool_trarget(
+            expected_df[dataset.target_column]
+        )
+
+        assert parsed_df.index.tolist() == expected_df.index.tolist()
+        pd.testing.assert_frame_equal(
+            parsed_df.loc[:, expected_df.columns], expected_df
+        )

@@ -66,6 +66,35 @@ def test_hash_row():
     )
     assert OnDiskPsmDataset._hash_row(x) == 4196757312
 
+
+def test_on_disk_split_invariants_and_determinism(psms_ondisk):
+    folds = 3
+    split_a = psms_ondisk._split(folds, np.random.default_rng(13))
+    split_b = psms_ondisk._split(folds, np.random.default_rng(13))
+
+    assert len(split_a) == folds
+    assert len(split_b) == folds
+    for fold_a, fold_b in zip(split_a, split_b):
+        np.testing.assert_array_equal(fold_a, fold_b)
+
+    num_rows = len(psms_ondisk.spectra_dataframe)
+    all_indices = np.concatenate(split_a)
+    np.testing.assert_array_equal(np.sort(all_indices), np.arange(num_rows))
+    assert len(np.unique(all_indices)) == num_rows
+
+    fold_by_idx = np.empty(num_rows, dtype=int)
+    for fold_idx, row_idx in enumerate(split_a):
+        fold_by_idx[row_idx] = fold_idx
+
+    grouped = psms_ondisk.spectra_dataframe.loc[
+        :, list(psms_ondisk.spectrum_columns)
+    ].copy()
+    grouped["fold"] = fold_by_idx
+    spectrum_fold_counts = grouped.groupby(
+        list(psms_ondisk.spectrum_columns), sort=False
+    )["fold"].nunique()
+    assert (spectrum_fold_counts == 1).all()
+
     x = np.array(
         [
             "test.mzML",

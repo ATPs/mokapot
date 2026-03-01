@@ -278,7 +278,7 @@ def drop_missing_values_and_fill_spectra_dataframe(
 
 @typechecked
 def get_rows_from_dataframe(
-    idx: Iterable,
+    idx_sets: Iterable[set[int]],
     chunk: pd.DataFrame,
     train_psms,
     target_column: str,
@@ -289,7 +289,7 @@ def get_rows_from_dataframe(
 
     Parameters
     ----------
-    idx : list of list of indexes
+    idx_sets : list of sets of indexes
         The indexes to select from dataframe.
     train_psms : list of list of dataframes
         Contains subsets of dataframes that are already extracted.
@@ -309,8 +309,9 @@ def get_rows_from_dataframe(
     # mentions "assiging column with incompatible dtype"
     del chunk[target_column]
     chunk.loc[:, target_column] = tmp
-    for k, train in enumerate(idx):
-        idx_ = list(set(train) & set(chunk.index))
+    chunk_idx_set = set(chunk.index)
+    for k, train_idx_set in enumerate(idx_sets):
+        idx_ = list(train_idx_set & chunk_idx_set)
         train_psms[file_idx][k].append(chunk.loc[idx_])
 
 
@@ -358,6 +359,7 @@ def parse_in_chunks(
     for dataset, idx, file_idx in zip(
         datasets, zip(*train_idx), range(len(datasets))
     ):
+        idx_sets = [set(train_fold_idx) for train_fold_idx in idx]
         # Note: Here idx is a tuple of len == number of folds
         #       each element is a list of ints, so each list is
         #       the indices for each split of the dataset.
@@ -374,7 +376,11 @@ def parse_in_chunks(
             #    in a parallel loop?
             Parallel(n_jobs=max_workers, require="sharedmem")(
                 delayed(get_rows_from_dataframe)(
-                    idx, chunk, train_psms, dataset.target_column, file_idx
+                    idx_sets,
+                    chunk,
+                    train_psms,
+                    dataset.target_column,
+                    file_idx,
                 )
                 for chunk in file_iterator
             )
@@ -382,7 +388,7 @@ def parse_in_chunks(
             # Handle LinearPsmDataset
             chunk = dataset.data
             get_rows_from_dataframe(
-                idx,
+                idx_sets,
                 chunk,
                 train_psms=train_psms,
                 target_column=dataset.target_column,

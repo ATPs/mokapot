@@ -8,6 +8,7 @@ from sklearn.tree import DecisionTreeClassifier
 
 import mokapot
 from mokapot import LinearPsmDataset, Model, PercolatorModel
+from mokapot.brew import resolve_parallelism
 
 np.random.seed(42)
 
@@ -297,3 +298,22 @@ def test_brew_using_non_trained_models_error(psms_ondisk, svm):
 def assert_not_close(x, y):
     """Assert that two arrays are not equal"""
     np.testing.assert_raises(AssertionError, np.testing.assert_allclose, x, y)
+
+
+def test_resolve_parallelism_auto():
+    assert resolve_parallelism(1, 3, "auto") == (1, 1)
+    assert resolve_parallelism(6, 3, "auto") == (3, 2)
+    assert resolve_parallelism(2, 5, "auto") == (2, 1)
+
+
+def test_resolve_parallelism_manual():
+    assert resolve_parallelism(8, 3, 4) == (3, 4)
+
+    with pytest.raises(ValueError):
+        resolve_parallelism(0, 3, "auto")
+
+    with pytest.raises(ValueError):
+        resolve_parallelism(2, 0, "auto")
+
+    with pytest.raises(ValueError):
+        resolve_parallelism(2, 2, 0)

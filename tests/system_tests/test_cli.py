@@ -105,10 +105,19 @@ def test_basic_cli(tmp_path, scope_files):
 def test_cli_help_mentions_model_formats():
     """Test --help messages for model save/load options."""
     help_text = Config().parser.format_help()
+    assert "--model_n_jobs" in help_text
     assert "--save-percolator-models" in help_text
     assert "Percolator" in help_text
     assert "--weights files" in help_text
     assert "pickled models (.pkl)" in help_text
+
+
+def test_cli_model_n_jobs_parse():
+    cfg_auto = Config(main_args=["data/scope2_FP97AA.pin", "--model_n_jobs", "auto"])
+    assert cfg_auto.model_n_jobs == "auto"
+
+    cfg_int = Config(main_args=["data/scope2_FP97AA.pin", "--model_n_jobs", "5"])
+    assert cfg_int.model_n_jobs == 5
 
 
 @pytest.mark.slow

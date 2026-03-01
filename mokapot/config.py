@@ -48,6 +48,26 @@ class Config:
         return self.args[option]
 
 
+def _parse_model_n_jobs(value: str) -> int | str:
+    """Parse --model_n_jobs as a positive integer or 'auto'."""
+    if value == "auto":
+        return value
+
+    try:
+        n_jobs = int(value)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(
+            "Expected a positive integer or 'auto'."
+        ) from err
+
+    if n_jobs < 1:
+        raise argparse.ArgumentTypeError(
+            "Expected a positive integer or 'auto'."
+        )
+
+    return n_jobs
+
+
 def _parser():
     """The parser"""
     desc = (
@@ -92,6 +112,16 @@ def _parser():
             "The number of processes to use for model training. Note that "
             "using more than one worker will result in garbled logging "
             "messages."
+        ),
+    )
+
+    parser.add_argument(
+        "--model_n_jobs",
+        default="auto",
+        type=_parse_model_n_jobs,
+        help=(
+            "The number of jobs used by the model hyperparameter search. "
+            "Use 'auto' to derive this from --max_workers and --folds."
         ),
     )
 

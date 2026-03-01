@@ -131,7 +131,9 @@ def make_bool_trarget(target_column: pd.Series):
     if target_column.dtype == bool:
         return target_column
 
-    if target_column.dtype == object:
+    if pd.api.types.is_object_dtype(
+        target_column.dtype
+    ) or pd.api.types.is_string_dtype(target_column.dtype):
         try:
             target_column = target_column.astype(int)
         except ValueError as e:
@@ -146,7 +148,13 @@ def make_bool_trarget(target_column: pd.Series):
         if uniq_vals == [0, 1]:
             # If so, we can just cast to bool
             return target_column.astype(bool)
+        elif uniq_vals == [0]:
+            return target_column.astype(bool)
+        elif uniq_vals == [1]:
+            return target_column.astype(bool)
         elif uniq_vals == [-1, 1]:
+            return target_column > 0
+        elif uniq_vals == [-1]:
             return target_column > 0
         else:
             raise ValueError(

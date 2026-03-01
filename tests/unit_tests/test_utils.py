@@ -212,3 +212,18 @@ def test_map_columns_to_indices():
         15,
         16,
     ]
+
+
+@pytest.mark.parametrize(
+    "values,expected",
+    [
+        ([-1, -1, -1], [False, False, False]),
+        ([1, 1, 1], [True, True, True]),
+        ([0, 0, 0], [False, False, False]),
+    ],
+)
+def test_make_bool_target_single_class(values, expected):
+    series = pd.Series(values, name="Label")
+    converted = utils.make_bool_trarget(series)
+    assert converted.dtype == bool
+    assert converted.tolist() == expected
