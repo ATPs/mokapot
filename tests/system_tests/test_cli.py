@@ -110,6 +110,9 @@ def test_cli_help_mentions_model_formats():
     assert "Percolator" in help_text
     assert "--weights files" in help_text
     assert "pickled models (.pkl)" in help_text
+    assert "(default: 1)" in help_text
+    assert "(default: 100000000)" in help_text
+    assert "(default: 8589934592)" in help_text
 
 
 def test_cli_model_n_jobs_parse():

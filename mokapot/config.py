@@ -11,13 +11,25 @@ from mokapot import __version__
 
 
 class MokapotHelpFormatter(argparse.HelpFormatter):
-    """Format help text to keep newlines and whitespace"""
+    """Format help text to keep newlines and expose defaults."""
 
     def _fill_text(self, text, width, indent):
         text_list = text.splitlines(keepends=True)
         return "\n".join(
             _process_line(line, width, indent) for line in text_list
         )
+
+    def _get_help_string(self, action):
+        help_string = action.help or ""
+        if "%(default)" in help_string:
+            return help_string
+        if action.default is argparse.SUPPRESS:
+            return help_string
+        if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
+            return help_string
+        if action.option_strings and action.default is not None:
+            return f"{help_string} (default: %(default)s)"
+        return help_string
 
 
 class Config:
@@ -98,8 +110,8 @@ def _parser():
         "--dest_dir",
         type=Path,
         help=(
-            "The directory in which to write the result files. Defaults to "
-            "the current working directory"
+            "The directory in which to write the result files. If omitted, "
+            "the current working directory is used."
         ),
     )
 
@@ -108,8 +120,8 @@ def _parser():
         type=Path,
         help=(
             "Temporary workspace directory for intermediate files. "
-            "Defaults to --dest_dir when set, otherwise the current "
-            "working directory."
+            "If omitted, uses --dest_dir when provided; otherwise the "
+            "current working directory."
         ),
     )
 
@@ -133,7 +145,7 @@ def _parser():
         action="store_true",
         help=(
             "Automatically convert large text PIN/TSV inputs to parquet "
-            "in the temporary workspace before parsing."
+            "in the temporary workspace before parsing. Enabled by default."
         ),
     )
 
@@ -152,7 +164,7 @@ def _parser():
         type=int,
         help=(
             "Trigger auto-parquet conversion when the total size of text "
-            "inputs reaches this many bytes."
+            "inputs reaches this many bytes (8 GiB by default)."
         ),
     )
 
