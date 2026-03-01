@@ -87,6 +87,7 @@ def _convert_one_text_input_to_parquet(
         destination_path,
         columns=columns,
         column_types=column_types,
+        from_pandas_nthreads=1,
     )
     with writer:
         for chunk in reader.get_chunked_data_iterator(
@@ -260,7 +261,11 @@ def _auto_convert_text_inputs_to_parquet(
     )
     LOGGER.info(
         "Auto-parquet conversion backend: ThreadPoolExecutor "
-        "(per-file parallel conversion)."
+        "(file-level parallel conversion, one worker per input file)."
+    )
+    LOGGER.info(
+        "Auto-parquet per-file Arrow conversion threads: nthreads=1 "
+        "(avoid intra-file oversubscription)."
     )
     _write_conversion_status(
         destination_dir,

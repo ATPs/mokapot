@@ -1,6 +1,7 @@
 import gzip
 import json
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pandas as pd
 
 import mokapot
 from mokapot.config import Config
+from mokapot.parsers import pin as pin_parser
 
 
 def test_config_parses_temp_and_auto_parquet_flags(tmp_path):
@@ -138,6 +140,58 @@ def test_read_pin_auto_parquet_force_rebuilds(tmp_path):
     parquet_files = sorted((tmp_path / "input_parquet").glob("*.parquet"))
     after = {path.name: path.stat().st_mtime_ns for path in parquet_files}
     assert any(after[name] > before[name] for name in before)
+
+
+def test_auto_parquet_parallelizes_across_files(tmp_path, monkeypatch):
+    pin_files = []
+    for idx in range(4):
+        pin = tmp_path / f"{idx}.pin"
+        pin.write_text(
+            "\n".join(
+                [
+                    "SpecId\tLabel\tScanNr\tExpMass\tMass\tPeptide\tProteins",
+                    f"{idx}\t1\t1\t500.2\t500.2\tPEP\t191889",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        pin_files.append(pin)
+
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def _fake_convert(source_path, destination_path, chunk_size_rows):
+        del source_path, chunk_size_rows
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            pd.DataFrame({"a": [1]}).to_parquet(destination_path, index=False)
+            time.sleep(0.2)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(
+        pin_parser,
+        "_convert_one_text_input_to_parquet",
+        _fake_convert,
+    )
+    converted = pin_parser._auto_convert_text_inputs_to_parquet(
+        pin_files,
+        max_workers=4,
+        temp_dir=tmp_path,
+        auto_parquet=True,
+        auto_parquet_min_bytes=1,
+        auto_parquet_min_files=1,
+        auto_parquet_workers=4,
+        force=True,
+    )
+    assert len(converted) == len(pin_files)
+    assert max_active > 1
 
 
 def test_read_pin_auto_parquet_disabled(tmp_path):

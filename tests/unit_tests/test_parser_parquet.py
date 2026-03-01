@@ -1,10 +1,12 @@
 """Test that parsing Percolator input files (parquet) works correctly"""
 
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import pytest
 
 import mokapot
+from mokapot.tabular_data.parquet import ParquetFileWriter
 
 
 @pytest.fixture
@@ -71,3 +73,32 @@ def test_parquet_parsing(std_parquet):
     pd.testing.assert_frame_equal(
         df.loc[:, ("scanNR",)], df.loc[:, datasets[0].spectrum_columns]
     )
+
+
+def test_parquet_writer_forwards_from_pandas_nthreads(tmp_path, monkeypatch):
+    out_file = tmp_path / "writer_nthreads.parquet"
+    writer = ParquetFileWriter(
+        out_file,
+        columns=["a", "b"],
+        column_types=[np.dtype("int64"), np.dtype("O")],
+        from_pandas_nthreads=1,
+    )
+    df = pd.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+
+    calls = []
+    import mokapot.tabular_data.parquet as parquet_module
+
+    real_table = parquet_module.pa.Table
+
+    class _TableProxy:
+        @staticmethod
+        def from_pandas(*args, **kwargs):
+            calls.append(kwargs.get("nthreads"))
+            return real_table.from_pandas(*args, **kwargs)
+
+    monkeypatch.setattr(parquet_module.pa, "Table", _TableProxy)
+    with writer:
+        writer.append_data(df)
+
+    assert calls
+    assert all(n == 1 for n in calls)

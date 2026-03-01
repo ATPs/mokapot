@@ -29,10 +29,15 @@ class ParquetFileWriter(TabularDataWriter):
         file_name: Path,
         columns: list[str],
         column_types: list[np.dtype],
+        from_pandas_nthreads: int | None = None,
     ):
         super().__init__(columns, column_types)
         self.file_name = file_name
         self.writer = None
+        if from_pandas_nthreads is None:
+            self.from_pandas_nthreads = None
+        else:
+            self.from_pandas_nthreads = max(1, int(from_pandas_nthreads))
 
     def __str__(self):
         return f"ParquetFileWriter({self.file_name=},{self.columns=})"
@@ -83,7 +88,13 @@ class ParquetFileWriter(TabularDataWriter):
             self.initialize()
 
         schema = self._get_schema()
-        table = pa.Table.from_pandas(data, preserve_index=False, schema=schema)
+        from_pandas_kwargs = {
+            "preserve_index": False,
+            "schema": schema,
+        }
+        if self.from_pandas_nthreads is not None:
+            from_pandas_kwargs["nthreads"] = self.from_pandas_nthreads
+        table = pa.Table.from_pandas(data, **from_pandas_kwargs)
         self.writer.write_table(table)
 
     def write(self, data: pd.DataFrame):
