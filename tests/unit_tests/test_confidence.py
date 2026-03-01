@@ -2,6 +2,7 @@
 
 import contextlib
 import copy
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -209,3 +210,64 @@ def test_assign_confidence_parquet(
         )
 
     assert_frame_equal(df_results_group1, df_results_group2)
+
+
+def test_assign_confidence_parallel_matches_sequential(tmp_path):
+    datasets = mokapot.read_pin(
+        [Path("data", "scope2_FP97AA.pin"), Path("data", "scope2_FP97AB.pin")],
+        max_workers=2,
+        auto_parquet=False,
+    )
+    rng = np.random.default_rng(7)
+    scores = [
+        np.where(dataset.target_values, 1.0, -1.0)
+        + rng.normal(scale=0.01, size=len(dataset.target_values))
+        for dataset in datasets
+    ]
+    prefixes = ["left", "right"]
+
+    sequential_dir = tmp_path / "seq"
+    sequential_dir.mkdir()
+    assign_confidence(
+        datasets=[copy.copy(dataset) for dataset in datasets],
+        scores_list=scores,
+        prefixes=prefixes,
+        dest_dir=sequential_dir,
+        max_workers=2,
+        confidence_workers=1,
+        eval_fdr=0.02,
+    )
+
+    parallel_dir = tmp_path / "par"
+    parallel_dir.mkdir()
+    assign_confidence(
+        datasets=[copy.copy(dataset) for dataset in datasets],
+        scores_list=scores,
+        prefixes=prefixes,
+        dest_dir=parallel_dir,
+        max_workers=2,
+        confidence_workers=2,
+        eval_fdr=0.02,
+    )
+
+    for prefix in prefixes:
+        assert_frame_equal(
+            pd.read_csv(
+                sequential_dir / f"{prefix}.targets.psms.tsv",
+                sep="\t",
+            ),
+            pd.read_csv(
+                parallel_dir / f"{prefix}.targets.psms.tsv",
+                sep="\t",
+            ),
+        )
+        assert_frame_equal(
+            pd.read_csv(
+                sequential_dir / f"{prefix}.targets.peptides.tsv",
+                sep="\t",
+            ),
+            pd.read_csv(
+                parallel_dir / f"{prefix}.targets.peptides.tsv",
+                sep="\t",
+            ),
+        )

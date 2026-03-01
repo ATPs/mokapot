@@ -120,3 +120,23 @@ def test_brew_with_temp_dir_and_memmap(tmp_path):
     assert len(scores) == 1
     assert len(scores[0]) == len(datasets[0].spectra_dataframe)
     assert (tmp_path / "memmap").exists()
+
+
+def test_brew_cleans_temp_train_buckets(tmp_path):
+    datasets = mokapot.read_pin(
+        Path("data", "10k_psms_test.parquet"),
+        max_workers=1,
+        auto_parquet=False,
+    )
+    _models, _scores = mokapot.brew(
+        datasets=datasets,
+        model=mokapot.PercolatorModel(rng=1, n_jobs=1),
+        max_workers=1,
+        folds=3,
+        rng=1,
+        test_fdr=1.0,
+        temp_dir=tmp_path,
+        memmap_threshold_psms=0,
+    )
+    bucket_dir = tmp_path / "fold_buckets"
+    assert not bucket_dir.exists()

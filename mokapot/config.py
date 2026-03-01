@@ -25,7 +25,10 @@ class MokapotHelpFormatter(argparse.HelpFormatter):
             return help_string
         if action.default is argparse.SUPPRESS:
             return help_string
-        if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
+        if isinstance(
+            action,
+            (argparse._StoreTrueAction, argparse._StoreFalseAction),
+        ):
             return help_string
         if action.option_strings and action.default is not None:
             return f"{help_string} (default: %(default)s)"
@@ -78,6 +81,26 @@ def _parse_model_n_jobs(value: str) -> int | str:
         )
 
     return n_jobs
+
+
+def _parse_workers_or_auto(value: str) -> int | str:
+    """Parse worker counts as a positive integer or 'auto'."""
+    if value == "auto":
+        return value
+
+    try:
+        workers = int(value)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(
+            "Expected a positive integer or 'auto'."
+        ) from err
+
+    if workers < 1:
+        raise argparse.ArgumentTypeError(
+            "Expected a positive integer or 'auto'."
+        )
+
+    return workers
 
 
 def _parser():
@@ -134,6 +157,36 @@ def _parser():
             "The number of processes to use for model training. Note that "
             "using more than one worker will result in garbled logging "
             "messages."
+        ),
+    )
+
+    parser.add_argument(
+        "--worker_policy",
+        default="auto",
+        choices=["auto", "manual"],
+        help=(
+            "Worker budget policy. 'auto' caps --max_workers to available "
+            "CPUs. 'manual' keeps the requested value as-is."
+        ),
+    )
+
+    parser.add_argument(
+        "--read_workers",
+        default="auto",
+        type=_parse_workers_or_auto,
+        help=(
+            "Workers used to read multiple input files in parallel. "
+            "Use 'auto' to infer from I/O probing."
+        ),
+    )
+
+    parser.add_argument(
+        "--confidence_workers",
+        default="auto",
+        type=_parse_workers_or_auto,
+        help=(
+            "Workers used to process multiple datasets during confidence "
+            "assignment. Use 'auto' to infer from --max_workers."
         ),
     )
 

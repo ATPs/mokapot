@@ -12,14 +12,17 @@ from pathlib import Path
 import numpy as np
 
 from . import __version__
-from .brew import brew, resolve_parallelism
+from .brew import brew
 from .confidence import assign_confidence
 from .config import Config
 from .model import (
     PercolatorModel,
-    load_models as load_models_file,
     save_percolator_models,
 )
+from .model import (
+    load_models as load_models_file,
+)
+from .parallelism import build_worker_plan
 from .parsers.fasta import read_fasta
 from .parsers.pin import read_pin
 from .temp_workspace import TempWorkspace
@@ -87,15 +90,43 @@ def main(main_args=None):
     logging.info("Temporary workspace: %s", workspace.path)
 
     try:
+        worker_plan = build_worker_plan(
+            psm_files=config.psm_files,
+            max_workers=config.max_workers,
+            folds=config.folds,
+            model_n_jobs=config.model_n_jobs,
+            worker_policy=config.worker_policy,
+            read_workers=config.read_workers,
+            confidence_workers=config.confidence_workers,
+            auto_parquet_workers=config.auto_parquet_workers,
+        )
+        logging.info(
+            "Resolved worker plan: effective_max_workers=%d, "
+            "outer_workers=%d, model_n_jobs=%d, read_workers=%d, "
+            "confidence_workers=%d, auto_parquet_workers=%d.",
+            worker_plan.effective_max_workers,
+            worker_plan.outer_workers,
+            worker_plan.model_n_jobs,
+            worker_plan.read_workers,
+            worker_plan.confidence_workers,
+            worker_plan.auto_parquet_workers,
+        )
+
         # Parse
+        parse_start = time.perf_counter()
         datasets = read_pin(
             config.psm_files,
-            max_workers=config.max_workers,
+            max_workers=worker_plan.effective_max_workers,
             temp_dir=workspace.path,
             auto_parquet=config.auto_parquet,
             auto_parquet_min_bytes=config.auto_parquet_min_bytes,
             auto_parquet_min_files=config.auto_parquet_min_files,
-            auto_parquet_workers=config.auto_parquet_workers,
+            auto_parquet_workers=worker_plan.auto_parquet_workers,
+            read_workers=worker_plan.read_workers,
+        )
+        logging.info(
+            "Parse stage completed in %.1fs.",
+            time.perf_counter() - parse_start,
         )
         if config.aggregate or len(config.psm_files) == 1:
             prefixes = ["" for f in config.psm_files]
@@ -118,15 +149,10 @@ def main(main_args=None):
         else:
             proteins = None
 
-        outer_workers, inner_workers = resolve_parallelism(
-            max_workers=config.max_workers,
-            folds=config.folds,
-            model_n_jobs=config.model_n_jobs,
-        )
         logging.debug(
             "Resolved parallelism: outer_workers=%d, model_n_jobs=%d",
-            outer_workers,
-            inner_workers,
+            worker_plan.outer_workers,
+            worker_plan.model_n_jobs,
         )
 
         # Define a model:
@@ -146,22 +172,27 @@ def main(main_args=None):
                 max_iter=config.max_iter,
                 direction=config.direction,
                 override=config.override,
-                n_jobs=inner_workers,
+                n_jobs=worker_plan.model_n_jobs,
                 rng=config.seed,
             )
 
         # Fit the models:
+        brew_start = time.perf_counter()
         models, scores = brew(
             datasets,
             model=model,
             test_fdr=config.test_fdr,
             folds=config.folds,
-            max_workers=outer_workers,
+            max_workers=worker_plan.outer_workers,
             subset_max_train=config.subset_max_train,
             ensemble=config.ensemble,
             rng=config.seed,
             temp_dir=workspace.path,
             memmap_threshold_psms=config.memmap_threshold_psms,
+        )
+        logging.info(
+            "Training/rescoring stage completed in %.1fs.",
+            time.perf_counter() - brew_start,
         )
         logging.info("")
 
@@ -170,9 +201,11 @@ def main(main_args=None):
         else:
             file_root = ""
 
+        confidence_start = time.perf_counter()
         assign_confidence(
             datasets=datasets,
-            max_workers=config.max_workers,
+            max_workers=worker_plan.effective_max_workers,
+            confidence_workers=worker_plan.confidence_workers,
             scores_list=scores,
             eval_fdr=config.test_fdr,
             dest_dir=config.dest_dir,
@@ -187,6 +220,10 @@ def main(main_args=None):
             qvalue_algorithm=config.qvalue_algorithm,
             sqlite_path=config.sqlite_db_path,
             stream_confidence=config.stream_confidence,
+        )
+        logging.info(
+            "Confidence stage completed in %.1fs.",
+            time.perf_counter() - confidence_start,
         )
 
         if config.save_models:

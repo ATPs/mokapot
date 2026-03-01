@@ -104,3 +104,55 @@ def test_determinism_different_psmid(tmp_path, psm_files_4000):
     df_run1_d_peptides = read_tsv("run1.decoys.peptides.tsv")
     df_run2_d_peptides = read_tsv("run2.decoys.peptides.tsv")
     pd.testing.assert_frame_equal(df_run1_d_peptides, df_run2_d_peptides)
+
+
+def test_determinism_worker_policy_auto_vs_manual(tmp_path, psm_files_4000):
+    """Changing worker policy must not change confidence results."""
+    params = [
+        ("--dest_dir", tmp_path),
+        ("--subset_max_train", "2500"),
+        ("--max_workers", "8"),
+        ("--max_iter", "2"),
+        "--keep_decoys",
+        "--ensemble",
+    ]
+    run_mokapot_cli(
+        params
+        + [
+            "--worker_policy",
+            "auto",
+            psm_files_4000[0],
+            "--file_root",
+            "auto",
+        ]
+    )
+    run_mokapot_cli(
+        params
+        + [
+            "--worker_policy",
+            "manual",
+            psm_files_4000[0],
+            "--file_root",
+            "manual",
+        ]
+    )
+
+    def read_tsv(filename):
+        return pd.read_csv(tmp_path / filename, sep="\t")
+
+    pd.testing.assert_frame_equal(
+        read_tsv("auto.targets.psms.tsv"),
+        read_tsv("manual.targets.psms.tsv"),
+    )
+    pd.testing.assert_frame_equal(
+        read_tsv("auto.targets.peptides.tsv"),
+        read_tsv("manual.targets.peptides.tsv"),
+    )
+    pd.testing.assert_frame_equal(
+        read_tsv("auto.decoys.psms.tsv"),
+        read_tsv("manual.decoys.psms.tsv"),
+    )
+    pd.testing.assert_frame_equal(
+        read_tsv("auto.decoys.peptides.tsv"),
+        read_tsv("manual.decoys.peptides.tsv"),
+    )

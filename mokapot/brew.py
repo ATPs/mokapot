@@ -267,19 +267,23 @@ def brew(
             )
 
     else:
-        train_bucket_paths = _write_train_buckets(
-            datasets=datasets,
-            fold_ids_list=fold_ids_list,
-            folds=folds,
-            chunk_size=CHUNK_SIZE_READ_ALL_DATA,
-            rng=rng,
-            subset_max_train=subset_max_train,
-            temp_dir=temp_dir,
-        )
-        fitted = Parallel(n_jobs=outer_workers, require="sharedmem")(
-            delayed(_fit_model)(bucket_path, datasets, copy.deepcopy(model), f)
-            for f, bucket_path in enumerate(train_bucket_paths)
-        )
+        train_bucket_paths = []
+        try:
+            train_bucket_paths = _write_train_buckets(
+                datasets=datasets,
+                fold_ids_list=fold_ids_list,
+                folds=folds,
+                chunk_size=CHUNK_SIZE_READ_ALL_DATA,
+                rng=rng,
+                subset_max_train=subset_max_train,
+                temp_dir=temp_dir,
+            )
+            fitted = Parallel(n_jobs=outer_workers, require="sharedmem")(
+                delayed(_fit_model)(bucket_path, datasets, copy.deepcopy(model), f)
+                for f, bucket_path in enumerate(train_bucket_paths)
+            )
+        finally:
+            _cleanup_train_buckets(train_bucket_paths)
 
     # Sort models to have deterministic results with multithreading.
     fitted.sort(key=lambda x: x[0].fold)
@@ -510,6 +514,27 @@ def _write_train_buckets(
         ", ".join(f"fold{idx}={rows}" for idx, rows in enumerate(rows_per_fold)),
     )
     return bucket_paths
+
+
+def _cleanup_train_buckets(bucket_paths: list[Path]) -> None:
+    """Best-effort cleanup of intermediate fold-bucket parquet files."""
+    if not bucket_paths:
+        return
+
+    parent_dirs = set()
+    for bucket_path in bucket_paths:
+        try:
+            parent_dirs.add(bucket_path.parent)
+            bucket_path.unlink(missing_ok=True)
+        except Exception as exc:  # pragma: no cover - defensive cleanup
+            LOGGER.debug("Unable to delete temp bucket %s: %s", bucket_path, exc)
+
+    for parent in parent_dirs:
+        try:
+            parent.rmdir()
+        except OSError:
+            # Directory not empty or cannot be removed; safe to ignore.
+            pass
 
 
 def make_train_sets(

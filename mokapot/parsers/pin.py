@@ -54,7 +54,8 @@ def _converted_path(
 ) -> Path:
     path_hash = sha1(str(source_path).encode("utf-8")).hexdigest()[:12]
     source_stem = source_path.name.replace("/", "_")
-    return destination_dir / f"{position:06d}.{source_stem}.{path_hash}.parquet"
+    file_name = f"{position:06d}.{source_stem}.{path_hash}.parquet"
+    return destination_dir / file_name
 
 
 def _convert_one_text_input_to_parquet(
@@ -196,6 +197,7 @@ def read_pin(
     expmass_column=None,
     rt_column=None,
     charge_column=None,
+    read_workers: int | None = None,
 ) -> list[OnDiskPsmDataset]:
     """Read Percolator input (PIN) tab-delimited files.
 
@@ -227,6 +229,9 @@ def read_pin(
         One or more PIN files to read or a :py:class:`pandas.DataFrame`.
     max_workers: int
         Maximum number of parallel processes to use.
+    read_workers : int, optional
+        Number of workers used to parse multiple input files in parallel.
+        Defaults to ``max_workers``.
     filename_column : str, optional
         The column specifying the MS data file. If :code:`None`, mokapot will
         look for a column called "filename" (case insensitive). This is
@@ -256,9 +261,16 @@ def read_pin(
         containing the PSMs from all of the PIN files.
     """
     logging.info("Parsing PSMs...")
+    started = time.perf_counter()
     pin_paths = [Path(pin_file) for pin_file in tuplize(pin_files)]
+    if read_workers is None:
+        read_workers = max_workers
+    read_workers = max(1, int(read_workers))
+
     if temp_dir is None:
-        temp_dir = Path.cwd() / ".mokapot-temp" / f"readpin-{uuid.uuid4().hex[:12]}"
+        temp_dir = (
+            Path.cwd() / ".mokapot-temp" / f"readpin-{uuid.uuid4().hex[:12]}"
+        )
 
     pin_paths = _auto_convert_text_inputs_to_parquet(
         pin_paths,
@@ -270,18 +282,59 @@ def read_pin(
         auto_parquet_workers=auto_parquet_workers,
     )
 
-    return [
-        read_percolator(
-            pin_file,
-            max_workers=max_workers,
-            filename_column=filename_column,
-            calcmass_column=calcmass_column,
-            expmass_column=expmass_column,
-            rt_column=rt_column,
-            charge_column=charge_column,
+    if len(pin_paths) <= 1 or read_workers <= 1:
+        datasets = [
+            read_percolator(
+                pin_file,
+                max_workers=max_workers,
+                filename_column=filename_column,
+                calcmass_column=calcmass_column,
+                expmass_column=expmass_column,
+                rt_column=rt_column,
+                charge_column=charge_column,
+            )
+            for pin_file in pin_paths
+        ]
+    else:
+        workers = min(read_workers, len(pin_paths))
+        LOGGER.info(
+            "Reading %d input files in parallel with %d workers.",
+            len(pin_paths),
+            workers,
         )
-        for pin_file in pin_paths
-    ]
+        datasets_ordered: list[OnDiskPsmDataset | None] = [
+            None
+        ] * len(pin_paths)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    read_percolator,
+                    pin_file,
+                    max_workers,
+                    filename_column,
+                    calcmass_column,
+                    expmass_column,
+                    rt_column,
+                    charge_column,
+                ): idx
+                for idx, pin_file in enumerate(pin_paths)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                datasets_ordered[idx] = future.result()
+
+        datasets = []
+        for dataset in datasets_ordered:
+            if dataset is None:  # pragma: no cover - defensive path
+                raise RuntimeError("Failed to parse one or more input files.")
+            datasets.append(dataset)
+
+    LOGGER.info(
+        "Finished parsing %d input file(s) in %.1fs.",
+        len(pin_paths),
+        time.perf_counter() - started,
+    )
+    return datasets
 
 
 def read_percolator(
@@ -404,7 +457,9 @@ def _scan_spectra_and_missing_features(
     for chunk in file_iterator:
         spectra_chunks.append(chunk[spectra_columns])
         if len(features):
-            feature_na_mask |= chunk[list(features)].isna().any(axis=0).to_numpy()
+            feature_na_mask |= (
+                chunk[list(features)].isna().any(axis=0).to_numpy()
+            )
 
     if spectra_chunks:
         df_spectra = pd.concat(spectra_chunks)

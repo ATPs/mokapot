@@ -42,10 +42,22 @@ class ParquetFileWriter(TabularDataWriter):
 
     @staticmethod
     def _from_numpy_dtype(type):
-        if type == "object":
+        numpy_dtype = getattr(type, "numpy_dtype", None)
+        if numpy_dtype is not None:
+            type = numpy_dtype
+
+        if str(type) in {"object", "string"}:
             return pa.string()
-        else:
-            return pa.from_numpy_dtype(type)
+
+        try:
+            numpy_type = np.dtype(type)
+        except TypeError:
+            return pa.string()
+
+        if numpy_type == np.dtype("O"):
+            return pa.string()
+
+        return pa.from_numpy_dtype(numpy_type)
 
     def _get_schema(self):
         schema = [

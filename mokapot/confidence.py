@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 from pprint import pformat
@@ -360,11 +361,144 @@ class Confidence:
 
 
 # Functions -------------------------------------------------------------------
+def _combine_file_root(file_root: str, prefix: str | None) -> str:
+    if prefix:
+        return f"{file_root}{prefix}."
+    return file_root
+
+
+def _can_parallelize_confidence(
+    *,
+    prefixes: list[str | None],
+    file_root: str,
+    sqlite_path: Path | None,
+    append_to_output_file: bool,
+    confidence_workers: int,
+) -> bool:
+    if confidence_workers <= 1:
+        return False
+
+    if sqlite_path is not None:
+        return False
+
+    if append_to_output_file:
+        return False
+
+    resolved_roots = [
+        _combine_file_root(file_root, prefix) for prefix in prefixes
+    ]
+    return len(set(resolved_roots)) == len(resolved_roots)
+
+
+def _assign_confidence_one_dataset(
+    *,
+    dataset: PsmDataset,
+    score: np.ndarray,
+    prefix: str | None,
+    max_workers: int,
+    eval_fdr: float,
+    dest_dir: Path,
+    file_root: str,
+    write_decoys: bool,
+    deduplication: bool,
+    do_rollup: bool,
+    proteins: Proteins | None,
+    protein_column: str | None,
+    append_to_output_file: bool,
+    rng: int | np.random.Generator,
+    peps_error: bool,
+    peps_algorithm: str,
+    qvalue_algorithm: str,
+    sqlite_path: Path | None,
+    stream_confidence: bool,
+) -> Confidence:
+    per_dataset_file_root = _combine_file_root(file_root, prefix)
+    level_manager = LevelManager.from_dataset(
+        dataset=dataset,
+        do_rollup=do_rollup,
+        dest_dir=dest_dir,
+        file_root=per_dataset_file_root,
+        protein_column=protein_column,
+        disable_proteins=proteins is None,
+    )
+    level_input_output_column_mapping = level_manager.build_output_col_mapping(
+        dataset
+    )
+
+    output_writers_factory = OutputWriterFactory(
+        id_column=dataset.column_groups.optional_columns.id,
+        peptide_column=dataset.column_groups.peptide_column,
+        spectra_columns=dataset.spectrum_columns,
+        protein_column=protein_column,
+        extra_output_columns=level_manager.extra_output_columns,
+        sqlite_path=sqlite_path,
+        append_to_output_file=append_to_output_file,
+        write_decoys=write_decoys,
+    )
+    output_writers, file_prefix = output_writers_factory.build_writers(
+        level_manager,
+        prefix=None,
+    )
+
+    score_reader = TabularDataReader.from_array(score, "mokapot_score")
+    with create_sorted_file_reader(
+        dataset=dataset,
+        score_reader=score_reader,
+        dest_dir=dest_dir,
+        file_prefix=file_prefix,
+        deduplication_columns=(
+            level_manager.level_hash_columns["psms"] if deduplication else None
+        ),
+        max_workers=max_workers,
+        input_output_column_mapping=level_input_output_column_mapping,
+        score_column=STANDARD_COLUMN_NAME_MAP["score"],
+    ) as sorted_file_reader:
+        LOGGER.info("Assigning confidence...")
+        LOGGER.info("Performing target-decoy competition...")
+        LOGGER.info(
+            "Keeping the best match per %s columns...",
+            "+".join(dataset.spectrum_columns),
+        )
+
+        sorted_file_iterator = sorted_file_reader.get_row_iterator(
+            row_type=BufferType.Dicts
+        )
+        type_map = sorted_file_reader.get_schema(as_dict=True)
+        level_writers = LevelWriterCollection.from_manager(
+            level_manager=level_manager,
+            type_map=type_map,
+            level_input_output_column_mapping=level_input_output_column_mapping,
+            deduplication=deduplication,
+        )
+
+        level_writers.sink_iterator(sorted_file_iterator)
+        level_writers.finalize()
+
+    return Confidence(
+        dataset=dataset,
+        levels=level_manager.levels_or_proteins,
+        level_paths=level_manager.level_data_paths,
+        peptide_column=dataset.peptide_column,
+        out_writers=output_writers,
+        eval_fdr=eval_fdr,
+        write_decoys=write_decoys,
+        do_rollup=do_rollup,
+        proteins=proteins,
+        rng=rng,
+        peps_error=peps_error,
+        peps_algorithm=peps_algorithm,
+        qvalue_algorithm=qvalue_algorithm,
+        stream_confidence=stream_confidence,
+        score_stats=level_writers.score_stats,
+    )
+
+
 @typechecked
 def assign_confidence(
     datasets: list[PsmDataset],
     scores_list: list[np.ndarray[float]] | None = None,
     max_workers: int = 1,
+    confidence_workers: int = 1,
     eval_fdr: float = 0.01,
     dest_dir: Path | None = None,
     file_root: str = "",
@@ -393,6 +527,9 @@ def assign_confidence(
         `mokapot.brew`, by default None.
     max_workers : int, optional
         Number of parallel workers to use for processing, by default 1.
+    confidence_workers : int, optional
+        Number of workers used to process independent datasets in parallel,
+        by default 1.
     eval_fdr : float, optional
         The FDR threshold at which to report and evaluate performance,
         by default 0.01.
@@ -460,32 +597,8 @@ def assign_confidence(
     if protein_column is None:
         protein_column = curr_dataset.column_groups.optional_columns.protein
 
-    level_manager = LevelManager.from_dataset(
-        dataset=curr_dataset,
-        do_rollup=do_rollup,
-        dest_dir=dest_dir,
-        file_root=file_root,
-        protein_column=protein_column,
-        disable_proteins=proteins is None,
-    )
-
-    output_writers_factory = OutputWriterFactory(
-        id_column=curr_dataset.column_groups.optional_columns.id,
-        peptide_column=curr_dataset.column_groups.peptide_column,
-        spectra_columns=curr_dataset.spectrum_columns,
-        protein_column=protein_column,
-        extra_output_columns=level_manager.extra_output_columns,
-        sqlite_path=sqlite_path,
-        append_to_output_file=append_to_output_file,
-        write_decoys=write_decoys,
-    )
-
     if prefixes is None:
         prefixes = [None] * len(datasets)
-
-    level_input_output_column_mapping = level_manager.build_output_col_mapping(
-        curr_dataset
-    )
 
     scores_use = scores_list
     if scores_use is None:
@@ -505,89 +618,99 @@ def assign_confidence(
             LOGGER.info("Scores found in psms, using them.")
             scores_use = [dataset.scores for dataset in datasets]
 
-    out = []
-
-    for dataset, score, prefix in strictzip(datasets, scores_use, prefixes):
-        # todo: nice to have: move this column renaming stuff into the
-        #   column defs module, and further, have standardized columns
-        #   directly from the pin reader (applying the renaming itself)
-
-        output_writers, file_prefix = output_writers_factory.build_writers(
-            level_manager,
-            prefix=prefix,
+    if len(prefixes) != len(datasets):
+        raise ValueError(
+            "The number of prefixes must match the number of datasets."
         )
 
-        # This section basically create a temporaty file for each level.
-        # This file preserves only the best PSM for each of the levels.
-        # For instance in the peptide level, it preserves as the peptide's
-        # entry, the best scoring PSM among all the PSMs that share the
-        # same peptide.
-        #
-        # Also note that there is not protein level at this point. that one
-        # is created later in the confidence assignment.
-        score_reader = TabularDataReader.from_array(score, "mokapot_score")
-        with create_sorted_file_reader(
-            dataset=dataset,
-            score_reader=score_reader,
-            dest_dir=dest_dir,
-            file_prefix=file_prefix,
-            deduplication_columns=(
-                level_manager.level_hash_columns["psms"]
-                if deduplication
-                else None
-            ),
-            max_workers=max_workers,
-            input_output_column_mapping=level_input_output_column_mapping,
-            score_column=STANDARD_COLUMN_NAME_MAP["score"],
-        ) as sorted_file_reader:
-            LOGGER.info("Assigning confidence...")
-            LOGGER.info("Performing target-decoy competition...")
+    out = [None for _ in datasets]
+    parallel_ok = _can_parallelize_confidence(
+        prefixes=prefixes,
+        file_root=file_root,
+        sqlite_path=sqlite_path,
+        append_to_output_file=append_to_output_file,
+        confidence_workers=confidence_workers,
+    )
+
+    if parallel_ok and len(datasets) > 1:
+        worker_count = min(confidence_workers, len(datasets))
+        LOGGER.info(
+            "Assigning confidence across %d datasets with %d workers.",
+            len(datasets),
+            worker_count,
+        )
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    _assign_confidence_one_dataset,
+                    dataset=dataset,
+                    score=score,
+                    prefix=prefix,
+                    max_workers=max_workers,
+                    eval_fdr=eval_fdr,
+                    dest_dir=dest_dir,
+                    file_root=file_root,
+                    write_decoys=write_decoys,
+                    deduplication=deduplication,
+                    do_rollup=do_rollup,
+                    proteins=proteins,
+                    protein_column=protein_column,
+                    append_to_output_file=False,
+                    rng=rng,
+                    peps_error=peps_error,
+                    peps_algorithm=peps_algorithm,
+                    qvalue_algorithm=qvalue_algorithm,
+                    sqlite_path=sqlite_path,
+                    stream_confidence=stream_confidence,
+                ): idx
+                for idx, (dataset, score, prefix) in enumerate(
+                    strictzip(datasets, scores_use, prefixes)
+                )
+            }
+            for future in as_completed(futures):
+                out[futures[future]] = future.result()
+    else:
+        if len(datasets) > 1 and confidence_workers > 1:
             LOGGER.info(
-                "Keeping the best match per %s columns...",
-                "+".join(dataset.spectrum_columns),
+                "Confidence dataset-level parallelism disabled to avoid "
+                "shared-output contention."
             )
 
-            # The columns we get from the sorted file iterator
-            sorted_file_iterator = sorted_file_reader.get_row_iterator(
-                row_type=BufferType.Dicts
-            )
-            type_map = sorted_file_reader.get_schema(as_dict=True)
-            level_writers = LevelWriterCollection.from_manager(
-                level_manager=level_manager,
-                type_map=type_map,
-                level_input_output_column_mapping=level_input_output_column_mapping,
+        append_mode = append_to_output_file
+        for idx, (dataset, score, prefix) in enumerate(
+            strictzip(datasets, scores_use, prefixes)
+        ):
+            out[idx] = _assign_confidence_one_dataset(
+                dataset=dataset,
+                score=score,
+                prefix=prefix,
+                max_workers=max_workers,
+                eval_fdr=eval_fdr,
+                dest_dir=dest_dir,
+                file_root=file_root,
+                write_decoys=write_decoys,
                 deduplication=deduplication,
+                do_rollup=do_rollup,
+                proteins=proteins,
+                protein_column=protein_column,
+                append_to_output_file=append_mode,
+                rng=rng,
+                peps_error=peps_error,
+                peps_algorithm=peps_algorithm,
+                qvalue_algorithm=qvalue_algorithm,
+                sqlite_path=sqlite_path,
+                stream_confidence=stream_confidence,
             )
+            if not prefix:
+                append_mode = True
 
-            level_writers.sink_iterator(sorted_file_iterator)
-            level_writers.finalize()
+    out_final = []
+    for confidence in out:
+        if confidence is None:  # pragma: no cover - defensive path
+            raise RuntimeError("Failed to assign confidence for all datasets.")
+        out_final.append(confidence)
 
-        con = Confidence(
-            dataset=dataset,
-            levels=level_manager.levels_or_proteins,
-            level_paths=level_manager.level_data_paths,
-            peptide_column=dataset.peptide_column,
-            out_writers=output_writers,
-            eval_fdr=eval_fdr,
-            write_decoys=write_decoys,
-            do_rollup=do_rollup,
-            proteins=proteins,
-            rng=rng,
-            peps_error=peps_error,
-            peps_algorithm=peps_algorithm,
-            qvalue_algorithm=qvalue_algorithm,
-            stream_confidence=stream_confidence,
-            score_stats=level_writers.score_stats,
-        )
-        out.append(con)
-        if not prefix:
-            # Having None as a prefix means that all outputs will be
-            # written to a single file, thus after the first iteration
-            # we stop initializing the writers (bc that generates over-writing
-            # the files instead of appending to them).
-            output_writers_factory.append_to_output_file = True
-
-    return out
+    return out_final
 
 
 class LevelWriterCollection:

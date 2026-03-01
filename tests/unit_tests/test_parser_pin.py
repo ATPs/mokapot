@@ -145,7 +145,10 @@ def test_missing_feature_values_are_dropped(tmp_path):
 
 
 def test_parse_in_chunks_matches_expected_rows():
-    datasets = mokapot.read_pin(Path("data", "scope2_FP97AA.pin"), max_workers=2)
+    datasets = mokapot.read_pin(
+        Path("data", "scope2_FP97AA.pin"),
+        max_workers=2,
+    )
     dataset = datasets[0]
     num_rows = len(dataset.spectra_dataframe)
     all_idx = np.arange(num_rows)
@@ -172,3 +175,23 @@ def test_parse_in_chunks_matches_expected_rows():
         pd.testing.assert_frame_equal(
             parsed_df.loc[:, expected_df.columns], expected_df
         )
+
+
+def test_read_pin_parallel_preserves_input_order(tmp_path):
+    src_pin = Path("data", "10k_psms_test.pin")
+    pin_a = tmp_path / "a.pin"
+    pin_b = tmp_path / "b.pin"
+    pin_c = tmp_path / "c.pin"
+    pin_a.write_bytes(src_pin.read_bytes())
+    pin_b.write_bytes(src_pin.read_bytes())
+    pin_c.write_bytes(src_pin.read_bytes())
+
+    requested_order = [pin_c, pin_a, pin_b]
+    datasets = mokapot.read_pin(
+        requested_order,
+        max_workers=4,
+        read_workers=3,
+        auto_parquet=False,
+    )
+    parsed_order = [Path(dataset.reader.file_name) for dataset in datasets]
+    assert parsed_order == requested_order
