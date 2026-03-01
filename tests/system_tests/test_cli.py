@@ -141,6 +141,34 @@ def test_cli_model_n_jobs_parse():
     assert cfg_worker_int.confidence_workers == 6
 
 
+def test_cli_success_cleans_workspace(tmp_path):
+    params = [
+        Path("data", "scope2_FP97AA.pin"),
+        ("--dest_dir", tmp_path / "out"),
+        ("--temp", tmp_path),
+        ("--max_iter", "1"),
+        ("--verbosity", "1"),
+    ]
+    run_mokapot_cli(params, run_in_subprocess=False)
+    temp_root = tmp_path / ".mokapot-temp"
+    assert (not temp_root.exists()) or (not any(temp_root.iterdir()))
+
+
+def test_cli_failure_keeps_workspace(tmp_path):
+    params = [
+        tmp_path / "missing.pin",
+        ("--dest_dir", tmp_path / "out"),
+        ("--temp", tmp_path),
+        ("--max_iter", "1"),
+        ("--verbosity", "1"),
+    ]
+    with pytest.raises(Exception):
+        run_mokapot_cli(params, run_in_subprocess=False)
+    temp_root = tmp_path / ".mokapot-temp"
+    assert temp_root.exists()
+    assert any(temp_root.iterdir())
+
+
 @pytest.mark.slow
 def test_cli_options(tmp_path, scope_files):
     """Test non-defaults"""

@@ -207,6 +207,37 @@ def test_read_pin_auto_parquet_proteins_stays_string(tmp_path):
     assert pd.api.types.is_string_dtype(proteins.dtype)
 
 
+def test_read_pin_auto_parquet_traditional_ragged_proteins(tmp_path):
+    pin = tmp_path / "ragged_traditional.pin"
+    pin.write_text(
+        "\n".join(
+            [
+                "SpecId\tLabel\tScanNr\tExpMass\tMass\tfeature_1\tPeptide\tProteins",
+                "1001\t1\t11\t500.2\t500.2\t2.1\tPEPTIDE\t191889\t191890",
+                "1002\t-1\t12\t501.2\t501.2\t1.2\tPEPTIDE\t191891",
+                "1003\t-1\t13\t502.2\t502.2\t0.8\tPEPTIDE\tDECOY_191889\t191892",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    datasets = mokapot.read_pin(
+        [pin],
+        max_workers=2,
+        temp_dir=tmp_path,
+        auto_parquet=True,
+        auto_parquet_min_bytes=1,
+        auto_parquet_min_files=1,
+        auto_parquet_workers=2,
+    )
+    assert len(datasets) == 1
+    proteins = datasets[0].read_data(columns=["Proteins"])["Proteins"]
+    assert proteins.iloc[0] == "191889:191890"
+    assert proteins.iloc[2] == "DECOY_191889:191892"
+    assert pd.api.types.is_string_dtype(proteins.dtype)
+
+
 def test_make_fold_ids_dtype_and_range():
     datasets = mokapot.read_pin(
         Path("data", "10k_psms_test.pin"),

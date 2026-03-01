@@ -93,6 +93,7 @@ def main(main_args=None):
         Path(temp_base_dir) / "input_parquet",
     )
 
+    analysis_succeeded = False
     try:
         worker_plan = build_worker_plan(
             psm_files=config.psm_files,
@@ -262,8 +263,16 @@ def main(main_args=None):
         logging.info("")
         logging.info("=== DONE! ===")
         logging.info("mokapot analysis completed in %s", total_time)
+        analysis_succeeded = True
     finally:
-        workspace.cleanup()
+        if analysis_succeeded:
+            workspace.cleanup()
+        else:
+            logging.warning(
+                "Analysis did not complete successfully; "
+                "retaining temporary workspace for debugging: %s",
+                workspace.path,
+            )
 
 
 if __name__ == "__main__":
