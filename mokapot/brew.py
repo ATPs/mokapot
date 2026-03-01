@@ -4,6 +4,8 @@ Defines a function to run the Percolator algorithm.
 
 import copy
 import logging
+import tempfile
+from pathlib import Path
 from operator import itemgetter
 from typing import Generator, Iterable
 
@@ -29,10 +31,42 @@ from mokapot.model import (
     ModelIterationError,
     PercolatorModel,
 )
-from mokapot.parsers.pin import parse_in_chunks
+from mokapot.tabular_data import TabularDataWriter
 from mokapot.utils import strictzip
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _fold_dtype(folds: int) -> np.dtype:
+    if folds <= np.iinfo(np.uint8).max:
+        return np.dtype("uint8")
+    if folds <= np.iinfo(np.uint16).max:
+        return np.dtype("uint16")
+    return np.dtype("uint32")
+
+
+def _allocate_large_array(
+    *,
+    length: int,
+    dtype: np.dtype,
+    temp_dir: Path | None,
+    memmap_threshold_psms: int,
+    file_name: str,
+) -> np.ndarray:
+    if (
+        temp_dir is not None
+        and memmap_threshold_psms > 0
+        and length >= memmap_threshold_psms
+    ):
+        memmap_path = Path(temp_dir) / "memmap"
+        memmap_path.mkdir(parents=True, exist_ok=True)
+        return np.memmap(
+            memmap_path / file_name,
+            mode="w+",
+            dtype=dtype,
+            shape=(length,),
+        )
+    return np.empty(length, dtype=dtype)
 
 
 # Functions -------------------------------------------------------------------
@@ -81,6 +115,8 @@ def brew(
     rng=None,
     subset_max_train: int | None = None,
     ensemble: bool = False,
+    temp_dir: Path | None = None,
+    memmap_threshold_psms: int = 100_000_000,
 ) -> tuple[list[Model], list[np.ndarray[np.float64]]]:
     """
     Re-score one or more collection of PSMs.
@@ -127,6 +163,11 @@ def brew(
         run time. An integer exceeding the number of folds will have
         no additional effect. Note that logging messages will be garbled
         if more than one worker is enabled.
+    temp_dir : pathlib.Path, optional
+        Directory to store large temporary arrays and fold training buckets.
+    memmap_threshold_psms : int, optional
+        Enable numpy.memmap for selected large arrays when dataset length is
+        at least this threshold.
     rng : int, np.random.Generator, optional
         A seed or generator used to generate splits, or None to use the
         default random number generator state.
@@ -143,6 +184,7 @@ def brew(
         max_workers=max_workers,
         folds=folds,
     )
+    temp_dir = Path(temp_dir) if temp_dir is not None else None
 
     rng = np.random.default_rng(rng)
     if model is None:
@@ -182,7 +224,23 @@ def brew(
             num_decoys,
         )
     LOGGER.info("Splitting PSMs into %i folds...", folds)
-    test_folds_idx = [dataset._split(folds, rng) for dataset in datasets]
+    fold_dtype = _fold_dtype(folds)
+    fold_ids_list = []
+    for ds_idx, (dataset, ds_size) in enumerate(zip(datasets, data_size)):
+        out = _allocate_large_array(
+            length=ds_size,
+            dtype=fold_dtype,
+            temp_dir=temp_dir,
+            memmap_threshold_psms=memmap_threshold_psms,
+            file_name=f"fold_ids.dataset-{ds_idx}.mmap",
+        )
+        fold_ids = dataset.make_fold_ids(
+            folds=folds,
+            rng=rng,
+            dtype=fold_dtype,
+            out=out,
+        )
+        fold_ids_list.append(fold_ids)
 
     # If trained models are provided, use them as-is.
     # If the model is not iterable, it means that a single model is pased, thus
@@ -209,24 +267,18 @@ def brew(
             )
 
     else:
-        train_sets = list(
-            make_train_sets(
-                test_idx=test_folds_idx,
-                subset_max_train=subset_max_train,
-                data_size=data_size,
-                rng=rng,
-            )
-        )
-        train_psms = parse_in_chunks(
+        train_bucket_paths = _write_train_buckets(
             datasets=datasets,
-            train_idx=train_sets,
+            fold_ids_list=fold_ids_list,
+            folds=folds,
             chunk_size=CHUNK_SIZE_READ_ALL_DATA,
-            max_workers=outer_workers,
+            rng=rng,
+            subset_max_train=subset_max_train,
+            temp_dir=temp_dir,
         )
-        del train_sets
         fitted = Parallel(n_jobs=outer_workers, require="sharedmem")(
-            delayed(_fit_model)(d, datasets, copy.deepcopy(model), f)
-            for f, d in enumerate(train_psms)
+            delayed(_fit_model)(bucket_path, datasets, copy.deepcopy(model), f)
+            for f, bucket_path in enumerate(train_bucket_paths)
         )
 
     # Sort models to have deterministic results with multithreading.
@@ -262,30 +314,15 @@ def brew(
                 for dataset in datasets
             ]
         else:
-            # generate model index for each psm in all folds
-            model_to_psm_idx = [
-                [[i] * len(idx) for i, idx in enumerate(test_fold_idx)]
-                for test_fold_idx in test_folds_idx
-            ]
-            # sort test indices and model indices in the original order
-            # (order of input data)
-            original_order_idx = [
-                np.argsort(utils.flatten(test_fold_idx)).tolist()
-                for test_fold_idx in test_folds_idx
-            ]
-            del test_folds_idx
-            model_to_psm_idx = [
-                np.concatenate(model_idx)[idx]
-                for model_idx, idx in zip(model_to_psm_idx, original_order_idx)
-            ]
-            del original_order_idx
             scores = list(
                 _predict(
-                    models_idx=model_to_psm_idx,
+                    fold_ids_list=fold_ids_list,
                     datasets=datasets,
                     models=models,
                     test_fdr=test_fdr,
                     max_workers=outer_workers,
+                    temp_dir=temp_dir,
+                    memmap_threshold_psms=memmap_threshold_psms,
                 )
             )
     else:
@@ -367,6 +404,114 @@ def brew(
 
 
 # Utility Functions -----------------------------------------------------------
+def _write_train_buckets(
+    *,
+    datasets: list[PsmDataset],
+    fold_ids_list: list[np.ndarray],
+    folds: int,
+    chunk_size: int,
+    rng,
+    subset_max_train: int | None,
+    temp_dir: Path | None,
+) -> list[Path]:
+    if temp_dir is None:
+        bucket_dir = Path(
+            tempfile.mkdtemp(
+                prefix=".mokapot-fold-buckets-",
+                dir=Path.cwd(),
+            )
+        )
+    else:
+        bucket_dir = Path(temp_dir) / "fold_buckets"
+        bucket_dir.mkdir(parents=True, exist_ok=True)
+
+    columns = datasets[0].columns
+    column_types = datasets[0].reader.get_column_types()
+
+    bucket_paths = [
+        bucket_dir / f"train_fold_{fold}.parquet" for fold in range(folds)
+    ]
+    writers = [
+        TabularDataWriter.from_suffix(
+            path,
+            columns=columns,
+            column_types=column_types,
+        )
+        for path in bucket_paths
+    ]
+
+    subset_max_train_per_file = []
+    if subset_max_train is not None:
+        subset_max_train_per_file = [
+            subset_max_train // len(datasets) for _ in range(len(datasets))
+        ]
+        subset_max_train_per_file[-1] += subset_max_train - sum(
+            subset_max_train_per_file
+        )
+
+    per_file_fold_remaining = None
+    if subset_max_train_per_file:
+        per_file_fold_remaining = np.zeros((len(datasets), folds), dtype=np.int64)
+        for file_idx, fold_ids in enumerate(fold_ids_list):
+            desired = subset_max_train_per_file[file_idx]
+            for fold in range(folds):
+                available = int(np.count_nonzero(fold_ids != fold))
+                per_file_fold_remaining[file_idx, fold] = min(desired, available)
+
+    rows_per_fold = np.zeros(folds, dtype=np.int64)
+    for writer in writers:
+        writer.initialize()
+
+    try:
+        for file_idx, (dataset, fold_ids) in enumerate(
+            zip(datasets, fold_ids_list)
+        ):
+            offset = 0
+            file_iterator = dataset.read_data_chunked(
+                chunk_size=chunk_size,
+                columns=dataset.columns,
+            )
+            for chunk in file_iterator:
+                # Keep target representation aligned with the legacy path.
+                chunk[dataset.target_column] = utils.make_bool_trarget(
+                    chunk[dataset.target_column]
+                )
+                chunk_rows = len(chunk.index)
+                chunk_fold_ids = np.asarray(fold_ids[offset : offset + chunk_rows])
+                offset += chunk_rows
+                for fold in range(folds):
+                    mask_idx = np.flatnonzero(chunk_fold_ids != fold)
+                    if len(mask_idx) == 0:
+                        continue
+
+                    if per_file_fold_remaining is not None:
+                        keep = int(per_file_fold_remaining[file_idx, fold])
+                        if keep <= 0:
+                            continue
+                        if len(mask_idx) > keep:
+                            mask_idx = rng.choice(
+                                mask_idx,
+                                keep,
+                                replace=False,
+                            )
+                        per_file_fold_remaining[file_idx, fold] -= len(mask_idx)
+
+                    out_chunk = chunk.iloc[mask_idx]
+                    if out_chunk.columns.tolist() != list(columns):
+                        out_chunk = out_chunk.reindex(columns=columns)
+                    writers[fold].append_data(out_chunk)
+                    rows_per_fold[fold] += len(out_chunk.index)
+    finally:
+        for writer in writers:
+            writer.finalize()
+
+    LOGGER.info(
+        "Prepared fold training buckets: %s",
+        ", ".join(f"fold{idx}={rows}" for idx, rows in enumerate(rows_per_fold)),
+    )
+    return bucket_paths
+
+
 def make_train_sets(
     test_idx, subset_max_train, data_size, rng
 ) -> Generator[list[list[int]], None, None]:
@@ -436,29 +581,34 @@ def _create_linear_dataset(
     )
 
 
-def get_index_values(df, col_name, val, orig_idx):
-    df = df[df[col_name] == val].drop(col_name, axis=1)
-    orig_idx[val] += list(df.index)
-    return df
-
-
 @typechecked
-def predict_fold(
+def _predict_fold_chunk(
     model: Model,
     fold: int,
-    dataset: LinearPsmDataset,
-    scores: list,
+    row_idx: np.ndarray,
+    chunk: pd.DataFrame,
+    dataset: PsmDataset,
 ):
-    scores[fold].append(model.predict(dataset))
+    if len(row_idx) == 0:
+        return fold, row_idx, np.array([], dtype=float)
+    psm_slice = chunk.iloc[row_idx].copy()
+    dataset_slice = _create_linear_dataset(
+        dataset,
+        psm_slice,
+        enforce_checks=False,
+    )
+    return fold, row_idx, model.predict(dataset_slice)
 
 
 @typechecked
 def _predict(
-    models_idx: list,
+    fold_ids_list: list[np.ndarray],
     datasets: Iterable[PsmDataset],
     models: Iterable[Model],
     test_fdr: float,
     max_workers: int,
+    temp_dir: Path | None,
+    memmap_threshold_psms: int,
 ):
     """
     Return the new scores for the dataset
@@ -467,8 +617,8 @@ def _predict(
     ----------
     datasets : Dict
         Contains all required info about the dataset to rescore
-    models_idx : list of numpy.ndarray
-        The indicies of the models to predict with
+    fold_ids_list : list of numpy.ndarray
+        Fold assignment for each row in each dataset.
     models : list of Model
         The models for each dataset and whether it
         was reset or not.
@@ -480,72 +630,95 @@ def _predict(
     numpy.ndarray
         A :py:class:`numpy.ndarray` containing the new scores.
     """
-    for dataset, mod_idx in zip(datasets, models_idx):
-        scores = []
-
+    for ds_idx, (dataset, fold_ids) in enumerate(zip(datasets, fold_ids_list)):
+        n_rows = len(fold_ids)
+        worker_count = min(max_workers, len(models))
+        raw_scores = _allocate_large_array(
+            length=n_rows,
+            dtype=np.dtype(float),
+            temp_dir=temp_dir,
+            memmap_threshold_psms=memmap_threshold_psms,
+            file_name=f"raw_scores.dataset-{ds_idx}.mmap",
+        )
+        raw_scores[:] = 0.0
+        targets = _allocate_large_array(
+            length=n_rows,
+            dtype=np.dtype(bool),
+            temp_dir=temp_dir,
+            memmap_threshold_psms=memmap_threshold_psms,
+            file_name=f"targets.dataset-{ds_idx}.mmap",
+        )
+        targets[:] = False
         n_folds = len(models)
-        worker_count = min(max_workers, n_folds)
-        fold_scores = [[] for _ in range(n_folds)]
-        targets = [[] for _ in range(n_folds)]
-        orig_idx = [[] for _ in range(n_folds)]
+        offset = 0
         file_iterator = dataset.read_data_chunked(
             columns=dataset.columns,
             chunk_size=CHUNK_SIZE_ROWS_PREDICTION,
         )
-        model_test_idx = utils.create_chunks(
-            data=mod_idx, chunk_size=CHUNK_SIZE_ROWS_PREDICTION
-        )
-        for i, psms_chunk in enumerate(file_iterator):
-            psms_chunk["fold"] = model_test_idx.pop(0)
-            psms_slices = [
-                get_index_values(psms_chunk, "fold", i, orig_idx)
-                for i in range(n_folds)
+        for psms_chunk in file_iterator:
+            chunk_size = len(psms_chunk.index)
+            chunk_fold_ids = np.asarray(fold_ids[offset : offset + chunk_size])
+            chunk_targets = utils.make_bool_trarget(psms_chunk[dataset.target_column])
+            targets[offset : offset + chunk_size] = np.asarray(chunk_targets)
+            row_indices = [
+                np.flatnonzero(chunk_fold_ids == fold_idx)
+                for fold_idx in range(n_folds)
             ]
-            dataset_slices = [
-                _create_linear_dataset(
-                    dataset,
-                    psm_slice,
-                    enforce_checks=False,
+            fold_results = Parallel(n_jobs=worker_count, require="sharedmem")(
+                delayed(_predict_fold_chunk)(
+                    model=models[fold_idx],
+                    fold=fold_idx,
+                    row_idx=row_indices[fold_idx],
+                    chunk=psms_chunk,
+                    dataset=dataset,
                 )
-                for psm_slice in psms_slices
-            ]
-            for i, dataset_slice in enumerate(dataset_slices):
-                targets[i].append(dataset_slice.targets)
-
-            Parallel(n_jobs=worker_count, require="sharedmem")(
-                delayed(predict_fold)(
-                    model=models[mod_idx],
-                    fold=mod_idx,
-                    dataset=dataset_slice,
-                    scores=fold_scores,
-                )
-                for mod_idx, dataset_slice in enumerate(dataset_slices)
+                for fold_idx in range(n_folds)
             )
-            del psms_slices, dataset_slices
-        del file_iterator
-        del model_test_idx
-        # What is this iteration doing?
-        for mod in models:
-            try:
-                scores.append(
-                    calibrate_scores(
-                        np.hstack(fold_scores.pop(0)),
-                        np.hstack(targets.pop(0)),
-                        test_fdr,
-                    )
+            covered = 0
+            for _, row_idx, fold_scores in fold_results:
+                if len(row_idx) == 0:
+                    continue
+                covered += len(row_idx)
+                raw_scores[offset + row_idx] = fold_scores
+            if covered != chunk_size:
+                raise RuntimeError(
+                    f"Prediction fold routing mismatch at offset {offset}: "
+                    f"covered {covered} rows for chunk size {chunk_size}."
                 )
-            except AttributeError:
-                scores.append(np.hstack(fold_scores.pop(0)))
+            offset += chunk_size
+
+        if offset != n_rows:
+            raise RuntimeError(
+                f"Prediction row count mismatch for dataset {ds_idx}: "
+                f"expected {n_rows}, got {offset}."
+            )
+
+        scores = _allocate_large_array(
+            length=n_rows,
+            dtype=np.dtype(float),
+            temp_dir=temp_dir,
+            memmap_threshold_psms=memmap_threshold_psms,
+            file_name=f"calibrated_scores.dataset-{ds_idx}.mmap",
+        )
+        scores[:] = 0.0
+        for fold_idx in range(n_folds):
+            fold_rows = np.flatnonzero(np.asarray(fold_ids) == fold_idx)
+            if len(fold_rows) == 0:
+                continue
+            try:
+                scores[fold_rows] = calibrate_scores(
+                    np.asarray(raw_scores[fold_rows]),
+                    np.asarray(targets[fold_rows]),
+                    test_fdr,
+                )
             except RuntimeError:
                 raise RuntimeError(
                     "Failed to calibrate scores between cross-validation "
                     "folds, because no target PSMs could be found below "
                     "'test_fdr'. Try raising 'test_fdr'."
                 )
-        del targets
-        del fold_scores
-        orig_idx = np.argsort(sum(orig_idx, [])).tolist()
-        yield np.concatenate(scores)[orig_idx]
+
+        yield np.asarray(scores)
 
 
 @typechecked
@@ -608,6 +781,8 @@ def _fit_model(train_set, psms, model: Model, fold):
     LOGGER.debug("")
     LOGGER.debug("=== Analyzing Fold %i ===", fold + 1)
     reset = False
+    if isinstance(train_set, (str, Path)):
+        train_set = pd.read_parquet(train_set)
     train_set = _create_linear_dataset(psms[0], train_set)
     try:
         model.fit(train_set)

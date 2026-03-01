@@ -274,6 +274,21 @@ class LinearPsmDataset(PsmDataset):
         out = tuple([inds[splits == i] for i in range(folds)])
         return out
 
+    def make_fold_ids(
+        self,
+        folds: int,
+        rng,
+        *,
+        dtype: np.dtype,
+        out: np.ndarray | None = None,
+    ) -> np.ndarray:
+        n_rows = len(self.spectra_dataframe.index)
+        if out is None:
+            out = np.empty(n_rows, dtype=dtype)
+        # Keep RNG draws aligned with _split(), then cast to requested storage.
+        out[:] = rng.integers(0, high=folds, size=n_rows).astype(dtype, copy=False)
+        return out
+
     def make_bool_trarget(self):
         out = utils.make_bool_trarget(self._data[self.target_column])
         self._data[self.target_column] = out

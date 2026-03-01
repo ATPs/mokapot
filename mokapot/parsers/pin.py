@@ -3,6 +3,10 @@ This module contains the parsers for reading in PSMs
 """
 
 import logging
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from hashlib import sha1
 from pathlib import Path
 from pprint import pformat
 from typing import Iterable
@@ -19,7 +23,7 @@ from mokapot.constants import (
     CHUNK_SIZE_ROWS_FOR_DROP_COLUMNS,
 )
 from mokapot.dataset import OnDiskPsmDataset, PsmDataset
-from mokapot.tabular_data import TabularDataReader
+from mokapot.tabular_data import TabularDataReader, TabularDataWriter
 from mokapot.utils import (
     make_bool_trarget,
     tuplize,
@@ -28,12 +32,165 @@ from mokapot.utils import (
 LOGGER = logging.getLogger(__name__)
 IMPORT_SCAN_CELL_BUDGET = 8_000_000
 IMPORT_SCAN_MIN_ROWS = 50_000
+AUTO_PARQUET_CHUNK_SIZE_ROWS = 200_000
+TEXT_INPUT_SUFFIXES = {".pin", ".tsv", ".tab", ".csv"}
+
+
+def _input_suffix(path: Path) -> str:
+    suffixes = path.suffixes
+    if len(suffixes) >= 2 and suffixes[-1] == ".gz":
+        return suffixes[-2]
+    return path.suffix
+
+
+def _is_text_input(path: Path) -> bool:
+    return _input_suffix(path) in TEXT_INPUT_SUFFIXES
+
+
+def _converted_path(
+    source_path: Path,
+    destination_dir: Path,
+    position: int,
+) -> Path:
+    path_hash = sha1(str(source_path).encode("utf-8")).hexdigest()[:12]
+    source_stem = source_path.name.replace("/", "_")
+    return destination_dir / f"{position:06d}.{source_stem}.{path_hash}.parquet"
+
+
+def _convert_one_text_input_to_parquet(
+    source_path: Path,
+    destination_path: Path,
+    chunk_size_rows: int,
+):
+    reader = TabularDataReader.from_path(source_path)
+    columns = reader.get_column_names()
+    column_types = reader.get_column_types()
+
+    writer = TabularDataWriter.from_suffix(
+        destination_path,
+        columns=columns,
+        column_types=column_types,
+    )
+    with writer:
+        for chunk in reader.get_chunked_data_iterator(
+            chunk_size=chunk_size_rows,
+            columns=columns,
+        ):
+            writer.append_data(chunk)
+
+
+def _auto_convert_text_inputs_to_parquet(
+    pin_files: list[Path],
+    *,
+    max_workers: int,
+    temp_dir: Path,
+    auto_parquet: bool,
+    auto_parquet_min_bytes: int,
+    auto_parquet_min_files: int,
+    auto_parquet_workers: int | None,
+) -> list[Path]:
+    if not auto_parquet:
+        return pin_files
+
+    text_inputs = [pin for pin in pin_files if _is_text_input(pin)]
+    if not text_inputs:
+        return pin_files
+
+    total_bytes = sum(pin.stat().st_size for pin in text_inputs)
+    should_convert = (
+        total_bytes >= auto_parquet_min_bytes
+        or len(text_inputs) >= auto_parquet_min_files
+    )
+    if not should_convert:
+        return pin_files
+
+    workers = auto_parquet_workers
+    if workers is None:
+        workers = max_workers
+    workers = max(1, workers)
+    workers = min(workers, len(text_inputs))
+
+    destination_dir = Path(temp_dir) / "input_parquet"
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+
+    LOGGER.info(
+        "Auto-parquet enabled: converting %d text input files "
+        "(total %.2f GiB) using %d workers.",
+        len(text_inputs),
+        total_bytes / 1024**3,
+        workers,
+    )
+
+    failed_paths: list[tuple[Path, Exception]] = []
+    converted_map: dict[Path, Path] = {}
+    converted_bytes = 0
+    finished = 0
+    text_input_positions = {path: i for i, path in enumerate(text_inputs)}
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {}
+        for source_path in text_inputs:
+            out_path = _converted_path(
+                source_path=source_path,
+                destination_dir=destination_dir,
+                position=text_input_positions[source_path],
+            )
+            futures[
+                executor.submit(
+                    _convert_one_text_input_to_parquet,
+                    source_path,
+                    out_path,
+                    AUTO_PARQUET_CHUNK_SIZE_ROWS,
+                )
+            ] = (source_path, out_path)
+
+        for future in as_completed(futures):
+            source_path, out_path = futures[future]
+            try:
+                future.result()
+                converted_map[source_path] = out_path
+            except Exception as exc:  # pragma: no cover - defensive path
+                failed_paths.append((source_path, exc))
+
+            finished += 1
+            converted_bytes += source_path.stat().st_size
+            elapsed = time.perf_counter() - started
+            LOGGER.info(
+                "Auto-parquet conversion progress: %d/%d files, %.2f GiB "
+                "processed, elapsed %.1fs.",
+                finished,
+                len(text_inputs),
+                converted_bytes / 1024**3,
+                elapsed,
+            )
+
+    if failed_paths:
+        LOGGER.error(
+            "Auto-parquet conversion failed for %d file(s):",
+            len(failed_paths),
+        )
+        for source_path, exc in failed_paths:
+            LOGGER.error("  - %s: %s", source_path, exc)
+        raise RuntimeError("Auto-parquet conversion failed.")
+
+    converted_files = [converted_map.get(pin, pin) for pin in pin_files]
+    LOGGER.info(
+        "Auto-parquet conversion finished in %.1fs.",
+        time.perf_counter() - started,
+    )
+    return converted_files
 
 
 # Functions -------------------------------------------------------------------
 def read_pin(
     pin_files,
     max_workers: int,
+    temp_dir: Path | None = None,
+    auto_parquet: bool = True,
+    auto_parquet_min_bytes: int = 8 * 1024**3,
+    auto_parquet_min_files: int = 256,
+    auto_parquet_workers: int | None = None,
     filename_column=None,
     calcmass_column=None,
     expmass_column=None,
@@ -99,6 +256,20 @@ def read_pin(
         containing the PSMs from all of the PIN files.
     """
     logging.info("Parsing PSMs...")
+    pin_paths = [Path(pin_file) for pin_file in tuplize(pin_files)]
+    if temp_dir is None:
+        temp_dir = Path.cwd() / ".mokapot-temp" / f"readpin-{uuid.uuid4().hex[:12]}"
+
+    pin_paths = _auto_convert_text_inputs_to_parquet(
+        pin_paths,
+        max_workers=max_workers,
+        temp_dir=temp_dir,
+        auto_parquet=auto_parquet,
+        auto_parquet_min_bytes=auto_parquet_min_bytes,
+        auto_parquet_min_files=auto_parquet_min_files,
+        auto_parquet_workers=auto_parquet_workers,
+    )
+
     return [
         read_percolator(
             pin_file,
@@ -109,7 +280,7 @@ def read_pin(
             rt_column=rt_column,
             charge_column=charge_column,
         )
-        for pin_file in tuplize(pin_files)
+        for pin_file in pin_paths
     ]
 
 

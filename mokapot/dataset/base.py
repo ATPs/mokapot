@@ -179,6 +179,21 @@ class PsmDataset(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def make_fold_ids(
+        self,
+        folds: int,
+        rng,
+        *,
+        dtype: np.dtype,
+        out: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Return fold ids for each row in the dataset.
+
+        The returned array must be aligned with row order in :meth:`read_data`.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def read_data(
         self,
         columns: list[str] | None = None,

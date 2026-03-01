@@ -104,6 +104,16 @@ def _parser():
     )
 
     parser.add_argument(
+        "--temp",
+        type=Path,
+        help=(
+            "Temporary workspace directory for intermediate files. "
+            "Defaults to --dest_dir when set, otherwise the current "
+            "working directory."
+        ),
+    )
+
+    parser.add_argument(
         "-w",
         "--max_workers",
         default=1,
@@ -112,6 +122,70 @@ def _parser():
             "The number of processes to use for model training. Note that "
             "using more than one worker will result in garbled logging "
             "messages."
+        ),
+    )
+
+    parser.add_argument(
+        "--auto-parquet",
+        "--auto_parquet",
+        dest="auto_parquet",
+        default=True,
+        action="store_true",
+        help=(
+            "Automatically convert large text PIN/TSV inputs to parquet "
+            "in the temporary workspace before parsing."
+        ),
+    )
+
+    parser.add_argument(
+        "--no-auto-parquet",
+        "--no_auto_parquet",
+        dest="auto_parquet",
+        action="store_false",
+        help="Disable automatic text-to-parquet conversion.",
+    )
+
+    parser.add_argument(
+        "--auto-parquet-min-bytes",
+        "--auto_parquet_min_bytes",
+        default=8 * 1024**3,
+        type=int,
+        help=(
+            "Trigger auto-parquet conversion when the total size of text "
+            "inputs reaches this many bytes."
+        ),
+    )
+
+    parser.add_argument(
+        "--auto-parquet-min-files",
+        "--auto_parquet_min_files",
+        default=256,
+        type=int,
+        help=(
+            "Trigger auto-parquet conversion when at least this many text "
+            "input files are provided."
+        ),
+    )
+
+    parser.add_argument(
+        "--auto-parquet-workers",
+        "--auto_parquet_workers",
+        default=None,
+        type=int,
+        help=(
+            "Number of workers used for parallel text-to-parquet conversion. "
+            "Defaults to --max_workers."
+        ),
+    )
+
+    parser.add_argument(
+        "--memmap-threshold-psms",
+        "--memmap_threshold_psms",
+        default=100_000_000,
+        type=int,
+        help=(
+            "Use numpy.memmap for selected large intermediate arrays when a "
+            "dataset has at least this many PSM rows."
         ),
     )
 

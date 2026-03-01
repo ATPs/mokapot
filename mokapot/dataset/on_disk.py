@@ -393,6 +393,63 @@ class OnDiskPsmDataset(PsmDataset):
             )
             return self._split_legacy(folds, rng)
 
+    def make_fold_ids(
+        self,
+        folds: int,
+        rng,
+        *,
+        dtype: np.dtype,
+        out: np.ndarray | None = None,
+    ) -> np.ndarray:
+        spectra = self.spectra_dataframe[list(self.spectrum_columns)]
+        spectra_hash = pd.util.hash_pandas_object(
+            spectra, index=False
+        ).to_numpy()
+        spectra_idx = np.argsort(spectra_hash, kind="mergesort")
+        n_rows = len(spectra_idx)
+        if out is None:
+            out = np.empty(n_rows, dtype=dtype)
+
+        if n_rows == 0:
+            return out
+
+        spectra_hash_sorted = spectra_hash[spectra_idx]
+        idx_start_unique = np.flatnonzero(
+            np.r_[True, spectra_hash_sorted[1:] != spectra_hash_sorted[:-1]]
+        )
+        fold_size = n_rows // folds
+        remainder = n_rows % folds
+
+        start_split_indices = []
+        start_idx = 0
+        for i in range(folds - 1):
+            end_idx = start_idx + fold_size + (1 if i < remainder else 0)
+            start_split_indices.append(end_idx)
+            start_idx = end_idx
+
+        if len(idx_start_unique):
+            idx_split_positions = np.searchsorted(
+                idx_start_unique,
+                start_split_indices,
+            )
+            idx_split_positions = np.clip(
+                idx_split_positions, 0, len(idx_start_unique) - 1
+            )
+            idx_split = idx_start_unique[idx_split_positions]
+        else:
+            idx_split = np.array([], dtype=int)
+
+        boundaries = np.concatenate(([0], idx_split, [n_rows]))
+        for fold_idx, (start, end) in enumerate(
+            zip(boundaries[:-1], boundaries[1:])
+        ):
+            fold_indices = spectra_idx[start:end].copy()
+            # Keep RNG consumption consistent with the legacy split path.
+            rng.shuffle(fold_indices)
+            out[fold_indices] = fold_idx
+
+        return out
+
     def _split_vectorized(self, folds, rng):
         spectra = self.spectra_dataframe[list(self.spectrum_columns)]
         spectra_hash = pd.util.hash_pandas_object(
