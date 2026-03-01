@@ -1,8 +1,11 @@
 import gzip
-from pathlib import Path
+import json
 import shutil
+import time
+from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 import mokapot
 from mokapot.config import Config
@@ -19,6 +22,18 @@ def test_config_parses_temp_and_auto_parquet_flags(tmp_path):
     )
     assert cfg.temp == tmp_path
     assert cfg.auto_parquet is False
+
+
+def test_config_parses_force_flag(tmp_path):
+    cfg = Config(
+        main_args=[
+            "--temp",
+            str(tmp_path),
+            "--force",
+            str(Path("data", "10k_psms_test.pin")),
+        ]
+    )
+    assert cfg.force is True
 
 
 def test_read_pin_auto_parquet_trigger_by_file_count(tmp_path):
@@ -38,9 +53,91 @@ def test_read_pin_auto_parquet_trigger_by_file_count(tmp_path):
         auto_parquet_workers=2,
     )
     assert len(datasets) == 2
-    assert all(dataset.get_default_extension() == ".parquet" for dataset in datasets)
+    assert all(
+        dataset.get_default_extension() == ".parquet" for dataset in datasets
+    )
     parquet_files = sorted((tmp_path / "input_parquet").glob("*.parquet"))
     assert len(parquet_files) == 2
+    complete_marker = tmp_path / "input_parquet" / "_auto_parquet_complete"
+    assert complete_marker.exists()
+    status_path = tmp_path / "input_parquet" / "_auto_parquet_status.json"
+    assert status_path.exists()
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status_payload["status"] == "complete"
+
+
+def test_read_pin_auto_parquet_reuses_temp_contents(tmp_path):
+    src_pin = Path("data", "10k_psms_test.pin")
+    in_a = tmp_path / "a.pin"
+    in_b = tmp_path / "b.pin"
+    in_a.write_bytes(src_pin.read_bytes())
+    in_b.write_bytes(src_pin.read_bytes())
+    inputs = [in_a, in_b]
+
+    _datasets = mokapot.read_pin(
+        inputs,
+        max_workers=2,
+        temp_dir=tmp_path,
+        auto_parquet=True,
+        auto_parquet_min_bytes=1,
+        auto_parquet_min_files=1,
+        auto_parquet_workers=2,
+        force=False,
+    )
+    parquet_files = sorted((tmp_path / "input_parquet").glob("*.parquet"))
+    assert len(parquet_files) == 2
+    before = {path.name: path.stat().st_mtime_ns for path in parquet_files}
+
+    _datasets = mokapot.read_pin(
+        inputs,
+        max_workers=2,
+        temp_dir=tmp_path,
+        auto_parquet=True,
+        auto_parquet_min_bytes=1,
+        auto_parquet_min_files=1,
+        auto_parquet_workers=2,
+        force=False,
+    )
+    parquet_files = sorted((tmp_path / "input_parquet").glob("*.parquet"))
+    after = {path.name: path.stat().st_mtime_ns for path in parquet_files}
+    assert before == after
+
+
+def test_read_pin_auto_parquet_force_rebuilds(tmp_path):
+    src_pin = Path("data", "10k_psms_test.pin")
+    in_a = tmp_path / "a.pin"
+    in_b = tmp_path / "b.pin"
+    in_a.write_bytes(src_pin.read_bytes())
+    in_b.write_bytes(src_pin.read_bytes())
+    inputs = [in_a, in_b]
+
+    _datasets = mokapot.read_pin(
+        inputs,
+        max_workers=2,
+        temp_dir=tmp_path,
+        auto_parquet=True,
+        auto_parquet_min_bytes=1,
+        auto_parquet_min_files=1,
+        auto_parquet_workers=2,
+        force=False,
+    )
+    parquet_files = sorted((tmp_path / "input_parquet").glob("*.parquet"))
+    before = {path.name: path.stat().st_mtime_ns for path in parquet_files}
+
+    time.sleep(1.1)
+    _datasets = mokapot.read_pin(
+        inputs,
+        max_workers=2,
+        temp_dir=tmp_path,
+        auto_parquet=True,
+        auto_parquet_min_bytes=1,
+        auto_parquet_min_files=1,
+        auto_parquet_workers=2,
+        force=True,
+    )
+    parquet_files = sorted((tmp_path / "input_parquet").glob("*.parquet"))
+    after = {path.name: path.stat().st_mtime_ns for path in parquet_files}
+    assert any(after[name] > before[name] for name in before)
 
 
 def test_read_pin_auto_parquet_disabled(tmp_path):
@@ -78,6 +175,36 @@ def test_read_pin_auto_parquet_with_traditional_pin_gz(tmp_path):
     assert len(datasets) == 1
     assert datasets[0].get_default_extension() == ".parquet"
     assert len(datasets[0].spectra_dataframe) > 0
+
+
+def test_read_pin_auto_parquet_proteins_stays_string(tmp_path):
+    pin = tmp_path / "mixed_proteins.pin"
+    pin.write_text(
+        "\n".join(
+            [
+                "SpecId\tLabel\tScanNr\tExpMass\tMass\tfeature_1\tPeptide\tProteins",
+                "1\t1\t1\t500.2\t500.2\t2.1\tPEPTIDE\t191889",
+                "2\t-1\t2\t501.2\t501.2\t1.2\tPEPTIDE\t191890",
+                "3\t-1\t3\t502.2\t502.2\t0.8\tPEPTIDE\tDECOY_191889",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    datasets = mokapot.read_pin(
+        [pin],
+        max_workers=2,
+        temp_dir=tmp_path,
+        auto_parquet=True,
+        auto_parquet_min_bytes=1,
+        auto_parquet_min_files=1,
+        auto_parquet_workers=2,
+    )
+    assert len(datasets) == 1
+    proteins = datasets[0].read_data(columns=["Proteins"])["Proteins"]
+    assert proteins.iloc[-1] == "DECOY_191889"
+    assert pd.api.types.is_string_dtype(proteins.dtype)
 
 
 def test_make_fold_ids_dtype_and_range():

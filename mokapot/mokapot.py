@@ -88,6 +88,10 @@ def main(main_args=None):
         temp_base_dir = config.dest_dir or Path.cwd()
     workspace = TempWorkspace(temp_base_dir)
     logging.info("Temporary workspace: %s", workspace.path)
+    logging.info(
+        "Auto-parquet cache directory: %s",
+        Path(temp_base_dir) / "input_parquet",
+    )
 
     try:
         worker_plan = build_worker_plan(
@@ -117,7 +121,8 @@ def main(main_args=None):
         datasets = read_pin(
             config.psm_files,
             max_workers=worker_plan.effective_max_workers,
-            temp_dir=workspace.path,
+            temp_dir=temp_base_dir,
+            force=config.force,
             auto_parquet=config.auto_parquet,
             auto_parquet_min_bytes=config.auto_parquet_min_bytes,
             auto_parquet_min_files=config.auto_parquet_min_files,

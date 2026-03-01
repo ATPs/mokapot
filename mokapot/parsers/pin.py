@@ -2,6 +2,7 @@
 This module contains the parsers for reading in PSMs
 """
 
+import json
 import logging
 import time
 import uuid
@@ -34,6 +35,17 @@ IMPORT_SCAN_CELL_BUDGET = 8_000_000
 IMPORT_SCAN_MIN_ROWS = 50_000
 AUTO_PARQUET_CHUNK_SIZE_ROWS = 200_000
 TEXT_INPUT_SUFFIXES = {".pin", ".tsv", ".tab", ".csv"}
+PIN_TEXT_COLUMNS = {
+    "specid",
+    "psmid",
+    "id",
+    "peptide",
+    "proteins",
+    "modifiedpeptide",
+    "precursor",
+    "peptidegroup",
+    "filename",
+}
 
 
 def _input_suffix(path: Path) -> str:
@@ -65,7 +77,11 @@ def _convert_one_text_input_to_parquet(
 ):
     reader = TabularDataReader.from_path(source_path)
     columns = reader.get_column_names()
-    column_types = reader.get_column_types()
+    text_columns = _infer_textual_pin_columns(columns)
+    column_types = _coerce_textual_pin_columns_to_string(
+        columns=columns,
+        column_types=reader.get_column_types(),
+    )
 
     writer = TabularDataWriter.from_suffix(
         destination_path,
@@ -77,7 +93,124 @@ def _convert_one_text_input_to_parquet(
             chunk_size=chunk_size_rows,
             columns=columns,
         ):
+            for column in text_columns:
+                if column in chunk.columns:
+                    chunk[column] = chunk[column].astype("string")
             writer.append_data(chunk)
+
+
+def _coerce_textual_pin_columns_to_string(
+    *,
+    columns: list[str],
+    column_types: list[np.dtype],
+) -> list[np.dtype]:
+    if len(columns) != len(column_types):  # pragma: no cover - defensive path
+        return column_types
+
+    text_columns = _infer_textual_pin_columns(columns)
+    out = list(column_types)
+    for idx, column_name in enumerate(columns):
+        if column_name in text_columns:
+            out[idx] = np.dtype("O")
+    return out
+
+
+def _infer_textual_pin_columns(columns: list[str]) -> set[str]:
+    out: set[str] = set()
+    for column_name in columns:
+        name = column_name.casefold()
+        if name in PIN_TEXT_COLUMNS or name.startswith("protein"):
+            out.add(column_name)
+    return out
+
+
+def _conversion_metadata_path(destination_path: Path) -> Path:
+    return destination_path.with_suffix(destination_path.suffix + ".meta.json")
+
+
+def _conversion_status_path(destination_dir: Path) -> Path:
+    return destination_dir / "_auto_parquet_status.json"
+
+
+def _conversion_complete_path(destination_dir: Path) -> Path:
+    return destination_dir / "_auto_parquet_complete"
+
+
+def _source_signature(source_path: Path) -> dict[str, int | str]:
+    stats = source_path.stat()
+    return {
+        "source_path": str(source_path.resolve()),
+        "source_size": int(stats.st_size),
+        "source_mtime_ns": int(stats.st_mtime_ns),
+    }
+
+
+def _write_conversion_metadata(
+    source_path: Path, destination_path: Path
+) -> None:
+    payload = _source_signature(source_path)
+    payload["converted_path"] = str(destination_path.resolve())
+    meta_path = _conversion_metadata_path(destination_path)
+    with open(meta_path, "w", encoding="utf-8") as out:
+        json.dump(payload, out, sort_keys=True)
+
+
+def _can_reuse_converted_file(
+    source_path: Path, destination_path: Path
+) -> bool:
+    if not destination_path.exists():
+        return False
+    try:
+        if destination_path.stat().st_size <= 0:
+            return False
+    except OSError:
+        return False
+
+    meta_path = _conversion_metadata_path(destination_path)
+    if not meta_path.exists():
+        return False
+
+    try:
+        with open(meta_path, encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+
+    signature = _source_signature(source_path)
+    return (
+        payload.get("source_path") == signature["source_path"]
+        and payload.get("source_size") == signature["source_size"]
+        and payload.get("source_mtime_ns") == signature["source_mtime_ns"]
+    )
+
+
+def _write_conversion_status(
+    destination_dir: Path,
+    *,
+    status: str,
+    workers: int,
+    total_files: int,
+    reused: int,
+    converted: int,
+    failed: int,
+    started_at: float,
+) -> None:
+    payload = {
+        "status": status,
+        "workers": workers,
+        "total_files": total_files,
+        "reused": reused,
+        "converted": converted,
+        "failed": failed,
+        "started_at_epoch_s": started_at,
+        "updated_at_epoch_s": time.time(),
+    }
+    with open(
+        _conversion_status_path(destination_dir),
+        "w",
+        encoding="utf-8",
+    ) as out:
+        json.dump(payload, out, sort_keys=True)
 
 
 def _auto_convert_text_inputs_to_parquet(
@@ -89,6 +222,7 @@ def _auto_convert_text_inputs_to_parquet(
     auto_parquet_min_bytes: int,
     auto_parquet_min_files: int,
     auto_parquet_workers: int | None,
+    force: bool,
 ) -> list[Path]:
     if not auto_parquet:
         return pin_files
@@ -114,6 +248,8 @@ def _auto_convert_text_inputs_to_parquet(
     destination_dir = Path(temp_dir) / "input_parquet"
     destination_dir.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
+    status_started = time.time()
+    _conversion_complete_path(destination_dir).unlink(missing_ok=True)
 
     LOGGER.info(
         "Auto-parquet enabled: converting %d text input files "
@@ -122,11 +258,26 @@ def _auto_convert_text_inputs_to_parquet(
         total_bytes / 1024**3,
         workers,
     )
+    LOGGER.info(
+        "Auto-parquet conversion backend: ThreadPoolExecutor "
+        "(per-file parallel conversion)."
+    )
+    _write_conversion_status(
+        destination_dir,
+        status="in_progress",
+        workers=workers,
+        total_files=len(text_inputs),
+        reused=0,
+        converted=0,
+        failed=0,
+        started_at=status_started,
+    )
 
     failed_paths: list[tuple[Path, Exception]] = []
     converted_map: dict[Path, Path] = {}
     converted_bytes = 0
     finished = 0
+    reused = 0
     text_input_positions = {path: i for i, path in enumerate(text_inputs)}
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -137,6 +288,36 @@ def _auto_convert_text_inputs_to_parquet(
                 destination_dir=destination_dir,
                 position=text_input_positions[source_path],
             )
+            if not force and _can_reuse_converted_file(source_path, out_path):
+                converted_map[source_path] = out_path
+                reused += 1
+                finished += 1
+                converted_bytes += source_path.stat().st_size
+                elapsed = time.perf_counter() - started
+                LOGGER.info(
+                    "Auto-parquet conversion progress: %d/%d files, %.2f GiB "
+                    "processed, elapsed %.1fs.",
+                    finished,
+                    len(text_inputs),
+                    converted_bytes / 1024**3,
+                    elapsed,
+                )
+                _write_conversion_status(
+                    destination_dir,
+                    status="in_progress",
+                    workers=workers,
+                    total_files=len(text_inputs),
+                    reused=reused,
+                    converted=finished - reused,
+                    failed=0,
+                    started_at=status_started,
+                )
+                continue
+
+            if force:
+                out_path.unlink(missing_ok=True)
+                _conversion_metadata_path(out_path).unlink(missing_ok=True)
+
             futures[
                 executor.submit(
                     _convert_one_text_input_to_parquet,
@@ -146,11 +327,17 @@ def _auto_convert_text_inputs_to_parquet(
                 )
             ] = (source_path, out_path)
 
+        LOGGER.info(
+            "Auto-parquet dispatch summary: submitted=%d, reused=%d.",
+            len(futures),
+            reused,
+        )
         for future in as_completed(futures):
             source_path, out_path = futures[future]
             try:
                 future.result()
                 converted_map[source_path] = out_path
+                _write_conversion_metadata(source_path, out_path)
             except Exception as exc:  # pragma: no cover - defensive path
                 failed_paths.append((source_path, exc))
 
@@ -165,8 +352,28 @@ def _auto_convert_text_inputs_to_parquet(
                 converted_bytes / 1024**3,
                 elapsed,
             )
+            _write_conversion_status(
+                destination_dir,
+                status="in_progress",
+                workers=workers,
+                total_files=len(text_inputs),
+                reused=reused,
+                converted=finished - reused,
+                failed=len(failed_paths),
+                started_at=status_started,
+            )
 
     if failed_paths:
+        _write_conversion_status(
+            destination_dir,
+            status="failed",
+            workers=workers,
+            total_files=len(text_inputs),
+            reused=reused,
+            converted=finished - reused,
+            failed=len(failed_paths),
+            started_at=status_started,
+        )
         LOGGER.error(
             "Auto-parquet conversion failed for %d file(s):",
             len(failed_paths),
@@ -177,8 +384,28 @@ def _auto_convert_text_inputs_to_parquet(
 
     converted_files = [converted_map.get(pin, pin) for pin in pin_files]
     LOGGER.info(
+        "Auto-parquet reuse summary: reused=%d, converted=%d.",
+        reused,
+        len(text_inputs) - reused,
+    )
+    LOGGER.info(
         "Auto-parquet conversion finished in %.1fs.",
         time.perf_counter() - started,
+    )
+    _write_conversion_status(
+        destination_dir,
+        status="complete",
+        workers=workers,
+        total_files=len(text_inputs),
+        reused=reused,
+        converted=finished - reused,
+        failed=0,
+        started_at=status_started,
+    )
+    _conversion_complete_path(destination_dir).touch(exist_ok=True)
+    LOGGER.info(
+        "Auto-parquet completion marker: %s",
+        _conversion_complete_path(destination_dir),
     )
     return converted_files
 
@@ -198,6 +425,7 @@ def read_pin(
     rt_column=None,
     charge_column=None,
     read_workers: int | None = None,
+    force: bool = False,
 ) -> list[OnDiskPsmDataset]:
     """Read Percolator input (PIN) tab-delimited files.
 
@@ -232,6 +460,8 @@ def read_pin(
     read_workers : int, optional
         Number of workers used to parse multiple input files in parallel.
         Defaults to ``max_workers``.
+    force : bool, optional
+        Force regeneration of temporary conversion artifacts in ``temp_dir``.
     filename_column : str, optional
         The column specifying the MS data file. If :code:`None`, mokapot will
         look for a column called "filename" (case insensitive). This is
@@ -280,6 +510,7 @@ def read_pin(
         auto_parquet_min_bytes=auto_parquet_min_bytes,
         auto_parquet_min_files=auto_parquet_min_files,
         auto_parquet_workers=auto_parquet_workers,
+        force=force,
     )
 
     if len(pin_paths) <= 1 or read_workers <= 1:

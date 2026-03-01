@@ -149,6 +149,16 @@ def _parser():
     )
 
     parser.add_argument(
+        "--force",
+        default=False,
+        action="store_true",
+        help=(
+            "Force regeneration of temporary intermediates in --temp "
+            "(for example, auto-parquet converted files)."
+        ),
+    )
+
+    parser.add_argument(
         "-w",
         "--max_workers",
         default=1,

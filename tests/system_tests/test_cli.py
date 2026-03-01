@@ -109,6 +109,7 @@ def test_cli_help_mentions_model_formats():
     assert "--worker_policy" in help_text
     assert "--read_workers" in help_text
     assert "--confidence_workers" in help_text
+    assert "--force" in help_text
     assert "--save-percolator-models" in help_text
     assert "Percolator" in help_text
     assert "--weights files" in help_text

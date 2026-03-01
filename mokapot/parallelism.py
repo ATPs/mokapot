@@ -46,7 +46,17 @@ def resolve_worker_budget(requested_max_workers: int, policy: str) -> int:
     if policy == "manual":
         return requested_max_workers
 
-    return min(requested_max_workers, effective_cpu_count())
+    cpu_cap = effective_cpu_count()
+    resolved = min(requested_max_workers, cpu_cap)
+    if resolved < requested_max_workers:
+        LOGGER.info(
+            "Capping max_workers from %d to %d based on available CPU budget "
+            "(worker_policy=auto, cpu_count=%d).",
+            requested_max_workers,
+            resolved,
+            cpu_cap,
+        )
+    return resolved
 
 
 def _build_probe_candidates(max_workers: int) -> list[int]:
@@ -143,6 +153,7 @@ def _resolve_worker_setting(
     worker_policy: str,
     setting_name: str,
 ) -> int:
+    requested = value
     resolved = default_workers
     if value is not None and value != "auto":
         resolved = int(value)
@@ -151,7 +162,17 @@ def _resolve_worker_setting(
         raise ValueError(f"'{setting_name}' must be >= 1 or 'auto'.")
 
     if worker_policy == "auto":
-        resolved = min(resolved, cap_workers)
+        capped = min(resolved, cap_workers)
+        if capped < resolved:
+            requested_txt = "auto" if requested in (None, "auto") else str(requested)
+            LOGGER.info(
+                "Capping %s from %s to %d based on worker budget "
+                "(worker_policy=auto).",
+                setting_name,
+                requested_txt,
+                capped,
+            )
+        resolved = capped
 
     return max(1, resolved)
 
