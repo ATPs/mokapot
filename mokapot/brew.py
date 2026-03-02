@@ -45,30 +45,6 @@ def _fold_dtype(folds: int) -> np.dtype:
     return np.dtype("uint32")
 
 
-def _allocate_large_array(
-    *,
-    length: int,
-    dtype: np.dtype,
-    temp_dir: Path | None,
-    memmap_threshold_psms: int,
-    file_name: str,
-) -> np.ndarray:
-    if (
-        temp_dir is not None
-        and memmap_threshold_psms > 0
-        and length >= memmap_threshold_psms
-    ):
-        memmap_path = Path(temp_dir) / "memmap"
-        memmap_path.mkdir(parents=True, exist_ok=True)
-        return np.memmap(
-            memmap_path / file_name,
-            mode="w+",
-            dtype=dtype,
-            shape=(length,),
-        )
-    return np.empty(length, dtype=dtype)
-
-
 # Functions -------------------------------------------------------------------
 @typechecked
 def resolve_parallelism(
@@ -116,7 +92,6 @@ def brew(
     subset_max_train: int | None = None,
     ensemble: bool = False,
     temp_dir: Path | None = None,
-    memmap_threshold_psms: int = 100_000_000,
 ) -> tuple[list[Model], list[np.ndarray[np.float64]]]:
     """
     Re-score one or more collection of PSMs.
@@ -164,10 +139,7 @@ def brew(
         no additional effect. Note that logging messages will be garbled
         if more than one worker is enabled.
     temp_dir : pathlib.Path, optional
-        Directory to store large temporary arrays and fold training buckets.
-    memmap_threshold_psms : int, optional
-        Enable numpy.memmap for selected large arrays when dataset length is
-        at least this threshold.
+        Directory to store temporary fold training buckets.
     rng : int, np.random.Generator, optional
         A seed or generator used to generate splits, or None to use the
         default random number generator state.
@@ -226,14 +198,8 @@ def brew(
     LOGGER.info("Splitting PSMs into %i folds...", folds)
     fold_dtype = _fold_dtype(folds)
     fold_ids_list = []
-    for ds_idx, (dataset, ds_size) in enumerate(zip(datasets, data_size)):
-        out = _allocate_large_array(
-            length=ds_size,
-            dtype=fold_dtype,
-            temp_dir=temp_dir,
-            memmap_threshold_psms=memmap_threshold_psms,
-            file_name=f"fold_ids.dataset-{ds_idx}.mmap",
-        )
+    for dataset, ds_size in zip(datasets, data_size):
+        out = np.empty(ds_size, dtype=fold_dtype)
         fold_ids = dataset.make_fold_ids(
             folds=folds,
             rng=rng,
@@ -325,8 +291,6 @@ def brew(
                     models=models,
                     test_fdr=test_fdr,
                     max_workers=outer_workers,
-                    temp_dir=temp_dir,
-                    memmap_threshold_psms=memmap_threshold_psms,
                 )
             )
     else:
@@ -632,8 +596,6 @@ def _predict(
     models: Iterable[Model],
     test_fdr: float,
     max_workers: int,
-    temp_dir: Path | None,
-    memmap_threshold_psms: int,
 ):
     """
     Return the new scores for the dataset
@@ -658,21 +620,9 @@ def _predict(
     for ds_idx, (dataset, fold_ids) in enumerate(zip(datasets, fold_ids_list)):
         n_rows = len(fold_ids)
         worker_count = min(max_workers, len(models))
-        raw_scores = _allocate_large_array(
-            length=n_rows,
-            dtype=np.dtype(float),
-            temp_dir=temp_dir,
-            memmap_threshold_psms=memmap_threshold_psms,
-            file_name=f"raw_scores.dataset-{ds_idx}.mmap",
-        )
+        raw_scores = np.empty(n_rows, dtype=np.dtype(float))
         raw_scores[:] = 0.0
-        targets = _allocate_large_array(
-            length=n_rows,
-            dtype=np.dtype(bool),
-            temp_dir=temp_dir,
-            memmap_threshold_psms=memmap_threshold_psms,
-            file_name=f"targets.dataset-{ds_idx}.mmap",
-        )
+        targets = np.empty(n_rows, dtype=np.dtype(bool))
         targets[:] = False
         n_folds = len(models)
         offset = 0
@@ -718,13 +668,7 @@ def _predict(
                 f"expected {n_rows}, got {offset}."
             )
 
-        scores = _allocate_large_array(
-            length=n_rows,
-            dtype=np.dtype(float),
-            temp_dir=temp_dir,
-            memmap_threshold_psms=memmap_threshold_psms,
-            file_name=f"calibrated_scores.dataset-{ds_idx}.mmap",
-        )
+        scores = np.empty(n_rows, dtype=np.dtype(float))
         scores[:] = 0.0
         for fold_idx in range(n_folds):
             fold_rows = np.flatnonzero(np.asarray(fold_ids) == fold_idx)

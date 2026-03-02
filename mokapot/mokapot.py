@@ -194,7 +194,6 @@ def main(main_args=None):
             ensemble=config.ensemble,
             rng=config.seed,
             temp_dir=workspace.path,
-            memmap_threshold_psms=config.memmap_threshold_psms,
         )
         logging.info(
             "Training/rescoring stage completed in %.1fs.",

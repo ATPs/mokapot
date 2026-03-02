@@ -254,17 +254,6 @@ def _parser():
     )
 
     parser.add_argument(
-        "--memmap-threshold-psms",
-        "--memmap_threshold_psms",
-        default=100_000_000,
-        type=int,
-        help=(
-            "Use numpy.memmap for selected large intermediate arrays when a "
-            "dataset has at least this many PSM rows."
-        ),
-    )
-
-    parser.add_argument(
         "--model_n_jobs",
         default="auto",
         type=_parse_model_n_jobs,

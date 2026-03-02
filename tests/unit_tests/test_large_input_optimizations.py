@@ -312,7 +312,7 @@ def test_make_fold_ids_dtype_and_range():
     assert int(fold_ids.max()) < 3
 
 
-def test_brew_with_temp_dir_and_memmap(tmp_path):
+def test_brew_with_temp_dir(tmp_path):
     datasets = mokapot.read_pin(
         Path("data", "10k_psms_test.parquet"),
         max_workers=1,
@@ -326,12 +326,10 @@ def test_brew_with_temp_dir_and_memmap(tmp_path):
         rng=1,
         test_fdr=1.0,
         temp_dir=tmp_path,
-        memmap_threshold_psms=1,
     )
     assert len(models) == 3
     assert len(scores) == 1
     assert len(scores[0]) == len(datasets[0].spectra_dataframe)
-    assert (tmp_path / "memmap").exists()
 
 
 def test_brew_cleans_temp_train_buckets(tmp_path):
@@ -348,7 +346,6 @@ def test_brew_cleans_temp_train_buckets(tmp_path):
         rng=1,
         test_fdr=1.0,
         temp_dir=tmp_path,
-        memmap_threshold_psms=0,
     )
     bucket_dir = tmp_path / "fold_buckets"
     assert not bucket_dir.exists()
